@@ -8,10 +8,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/notification"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/golang/protobuf/proto"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/notification"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 func init() {
@@ -27,29 +27,29 @@ func (k *AwsSqsPub) GetName() string {
 	return "aws_sqs"
 }
 
-func (k *AwsSqsPub) Initialize(configuration util.Configuration) (err error) {
-	glog.V(0).Infof("filer.notification.aws_sqs.region: %v", configuration.GetString("region"))
-	glog.V(0).Infof("filer.notification.aws_sqs.sqs_queue_name: %v", configuration.GetString("sqs_queue_name"))
+func (k *AwsSqsPub) Initialize(configuration util.Configuration, prefix string) (err error) {
+	glog.V(0).Infof("filer.notification.aws_sqs.region: %v", configuration.GetString(prefix+"region"))
+	glog.V(0).Infof("filer.notification.aws_sqs.sqs_queue_name: %v", configuration.GetString(prefix+"sqs_queue_name"))
 	return k.initialize(
-		configuration.GetString("aws_access_key_id"),
-		configuration.GetString("aws_secret_access_key"),
-		configuration.GetString("region"),
-		configuration.GetString("sqs_queue_name"),
+		configuration.GetString(prefix+"aws_access_key_id"),
+		configuration.GetString(prefix+"aws_secret_access_key"),
+		configuration.GetString(prefix+"region"),
+		configuration.GetString(prefix+"sqs_queue_name"),
 	)
 }
 
-func (k *AwsSqsPub) initialize(awsAccessKeyId, aswSecretAccessKey, region, queueName string) (err error) {
+func (k *AwsSqsPub) initialize(awsAccessKeyId, awsSecretAccessKey, region, queueName string) (err error) {
 
 	config := &aws.Config{
 		Region: aws.String(region),
 	}
-	if awsAccessKeyId != "" && aswSecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, aswSecretAccessKey, "")
+	if awsAccessKeyId != "" && awsSecretAccessKey != "" {
+		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, awsSecretAccessKey, "")
 	}
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return fmt.Errorf("create aws session: %v", err)
+		return fmt.Errorf("create aws session: %w", err)
 	}
 	k.svc = sqs.New(sess)
 
@@ -70,7 +70,10 @@ func (k *AwsSqsPub) initialize(awsAccessKeyId, aswSecretAccessKey, region, queue
 
 func (k *AwsSqsPub) SendMessage(key string, message proto.Message) (err error) {
 
-	text := proto.MarshalTextString(message)
+	text, err := proto.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("send message marshal %+v: %v", message, err)
+	}
 
 	_, err = k.svc.SendMessage(&sqs.SendMessageInput{
 		DelaySeconds: aws.Int64(10),
@@ -80,7 +83,7 @@ func (k *AwsSqsPub) SendMessage(key string, message proto.Message) (err error) {
 				StringValue: aws.String(key),
 			},
 		},
-		MessageBody: aws.String(text),
+		MessageBody: aws.String(string(text)),
 		QueueUrl:    &k.queueUrl,
 	})
 

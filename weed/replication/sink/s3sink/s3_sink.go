@@ -1,30 +1,49 @@
 package S3Sink
 
 import (
-	"context"
+	"encoding/base64"
 	"fmt"
+	"mime"
+	"net/url"
+	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/replication/sink"
-	"github.com/chrislusf/seaweedfs/weed/replication/source"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
+	"github.com/seaweedfs/seaweedfs/weed/replication/source"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"golang.org/x/net/http/httpguts"
 )
 
+// maxMetadataSize is the S3 limit on user metadata, counted over keys and values.
+const maxMetadataSize = 2 * 1024
+
 type S3Sink struct {
-	conn        s3iface.S3API
-	region      string
-	bucket      string
-	dir         string
-	filerSource *source.FilerSource
+	conn                          s3iface.S3API
+	filerSource                   *source.FilerSource
+	isIncremental                 bool
+	keepPartSize                  bool
+	s3DisableContentMD5Validation bool
+	s3ForcePathStyle              bool
+	uploaderConcurrency           int
+	uploaderMaxUploadParts        int
+	uploaderPartSizeMb            int
+	region                        string
+	bucket                        string
+	dir                           string
+	endpoint                      string
+	acl                           string
 }
 
 func init() {
@@ -39,16 +58,58 @@ func (s3sink *S3Sink) GetSinkToDirectory() string {
 	return s3sink.dir
 }
 
-func (s3sink *S3Sink) Initialize(configuration util.Configuration) error {
-	glog.V(0).Infof("sink.s3.region: %v", configuration.GetString("region"))
-	glog.V(0).Infof("sink.s3.bucket: %v", configuration.GetString("bucket"))
-	glog.V(0).Infof("sink.s3.directory: %v", configuration.GetString("directory"))
+func (s3sink *S3Sink) GetDestinationIdentity() string {
+	return s3sink.endpoint + "\x00" + s3sink.bucket + "\x00" + s3sink.dir
+}
+
+func (s3sink *S3Sink) IsIncremental() bool {
+	return s3sink.isIncremental
+}
+
+func (s3sink *S3Sink) Initialize(configuration util.Configuration, prefix string) error {
+	configuration.SetDefault(prefix+"region", "us-east-2")
+	configuration.SetDefault(prefix+"directory", "/")
+	configuration.SetDefault(prefix+"keep_part_size", true)
+	configuration.SetDefault(prefix+"uploader_max_upload_parts", 1000)
+	configuration.SetDefault(prefix+"uploader_part_size_mb", 8)
+	configuration.SetDefault(prefix+"uploader_concurrency", 8)
+	configuration.SetDefault(prefix+"s3_disable_content_md5_validation", true)
+	configuration.SetDefault(prefix+"s3_force_path_style", true)
+	s3sink.region = configuration.GetString(prefix + "region")
+	s3sink.bucket = configuration.GetString(prefix + "bucket")
+	s3sink.dir = configuration.GetString(prefix + "directory")
+	s3sink.endpoint = configuration.GetString(prefix + "endpoint")
+	s3sink.acl = configuration.GetString(prefix + "acl")
+	s3sink.isIncremental = configuration.GetBool(prefix + "is_incremental")
+	s3sink.keepPartSize = configuration.GetBool(prefix + "keep_part_size")
+	s3sink.s3DisableContentMD5Validation = configuration.GetBool(prefix + "s3_disable_content_md5_validation")
+	s3sink.s3ForcePathStyle = configuration.GetBool(prefix + "s3_force_path_style")
+	s3sink.uploaderMaxUploadParts = configuration.GetInt(prefix + "uploader_max_upload_parts")
+	s3sink.uploaderPartSizeMb = configuration.GetInt(prefix + "uploader_part_size")
+	s3sink.uploaderConcurrency = configuration.GetInt(prefix + "uploader_concurrency")
+
+	glog.V(0).Infof("sink.s3.region: %v", s3sink.region)
+	glog.V(0).Infof("sink.s3.bucket: %v", s3sink.bucket)
+	glog.V(0).Infof("sink.s3.directory: %v", s3sink.dir)
+	glog.V(0).Infof("sink.s3.endpoint: %v", s3sink.endpoint)
+	glog.V(0).Infof("sink.s3.acl: %v", s3sink.acl)
+	glog.V(0).Infof("sink.s3.is_incremental: %v", s3sink.isIncremental)
+	glog.V(0).Infof("sink.s3.s3_disable_content_md5_validation: %v", s3sink.s3DisableContentMD5Validation)
+	glog.V(0).Infof("sink.s3.s3_force_path_style: %v", s3sink.s3ForcePathStyle)
+	glog.V(0).Infof("sink.s3.keep_part_size: %v", s3sink.keepPartSize)
+	if s3sink.uploaderMaxUploadParts > s3manager.MaxUploadParts {
+		s3sink.uploaderMaxUploadParts = s3manager.MaxUploadParts
+		glog.Warningf("uploader_max_upload_parts is greater than the maximum number of parts allowed when uploading multiple parts to Amazon S3")
+		glog.V(0).Infof("sink.s3.uploader_max_upload_parts: %v => %v", s3sink.uploaderMaxUploadParts, s3manager.MaxUploadParts)
+	} else {
+		glog.V(0).Infof("sink.s3.uploader_max_upload_parts: %v", s3sink.uploaderMaxUploadParts)
+	}
+	glog.V(0).Infof("sink.s3.uploader_part_size_mb: %v", s3sink.uploaderPartSizeMb)
+	glog.V(0).Infof("sink.s3.uploader_concurrency: %v", s3sink.uploaderConcurrency)
+
 	return s3sink.initialize(
-		configuration.GetString("aws_access_key_id"),
-		configuration.GetString("aws_secret_access_key"),
-		configuration.GetString("region"),
-		configuration.GetString("bucket"),
-		configuration.GetString("directory"),
+		configuration.GetString(prefix+"aws_access_key_id"),
+		configuration.GetString(prefix+"aws_secret_access_key"),
 	)
 }
 
@@ -56,84 +117,127 @@ func (s3sink *S3Sink) SetSourceFiler(s *source.FilerSource) {
 	s3sink.filerSource = s
 }
 
-func (s3sink *S3Sink) initialize(awsAccessKeyId, aswSecretAccessKey, region, bucket, dir string) error {
-	s3sink.region = region
-	s3sink.bucket = bucket
-	s3sink.dir = dir
-
+func (s3sink *S3Sink) initialize(awsAccessKeyId, awsSecretAccessKey string) error {
 	config := &aws.Config{
-		Region: aws.String(s3sink.region),
+		Region:                        aws.String(s3sink.region),
+		Endpoint:                      aws.String(s3sink.endpoint),
+		S3DisableContentMD5Validation: aws.Bool(s3sink.s3DisableContentMD5Validation),
+		S3ForcePathStyle:              aws.Bool(s3sink.s3ForcePathStyle),
 	}
-	if awsAccessKeyId != "" && aswSecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, aswSecretAccessKey, "")
+	if awsAccessKeyId != "" && awsSecretAccessKey != "" {
+		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, awsSecretAccessKey, "")
 	}
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return fmt.Errorf("create aws session: %v", err)
+		return fmt.Errorf("create aws session: %w", err)
 	}
 	s3sink.conn = s3.New(sess)
 
 	return nil
 }
 
-func (s3sink *S3Sink) DeleteEntry(ctx context.Context, key string, isDirectory, deleteIncludeChunks bool) error {
+func (s3sink *S3Sink) DeleteEntry(key string, isDirectory, deleteIncludeChunks bool, signatures []int32) error {
 
 	key = cleanKey(key)
 
 	if isDirectory {
-		key = key + "/"
+		return nil
 	}
 
-	return s3sink.deleteObject(key)
+	input := &s3.DeleteObjectInput{
+		Bucket: aws.String(s3sink.bucket),
+		Key:    aws.String(key),
+	}
+
+	result, err := s3sink.conn.DeleteObject(input)
+
+	if err == nil {
+		glog.V(2).Infof("[%s] delete %s: %v", s3sink.bucket, key, result)
+	} else {
+		glog.Errorf("[%s] delete %s: %v", s3sink.bucket, key, err)
+	}
+
+	return err
 
 }
 
-func (s3sink *S3Sink) CreateEntry(ctx context.Context, key string, entry *filer_pb.Entry) error {
-
+func (s3sink *S3Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int32) (err error) {
 	key = cleanKey(key)
 
 	if entry.IsDirectory {
 		return nil
 	}
 
-	uploadId, err := s3sink.createMultipartUpload(key, entry)
+	reader := filer.NewFileReader(s3sink.filerSource, entry)
+
+	// Decrypt SSE-encrypted objects so the destination receives plaintext
+	decryptedReader, err := repl_util.MaybeDecryptReader(reader, entry)
 	if err != nil {
-		return err
+		repl_util.CloseReader(reader)
+		return fmt.Errorf("decrypt SSE object: %w", err)
 	}
+	defer repl_util.CloseMaybeDecryptedReader(reader, decryptedReader)
 
-	totalSize := filer2.TotalSize(entry.Chunks)
-	chunkViews := filer2.ViewFromChunks(entry.Chunks, 0, int(totalSize))
+	// Create an uploader with the session and custom options
+	uploader := s3manager.NewUploaderWithClient(s3sink.conn, func(u *s3manager.Uploader) {
+		u.PartSize = int64(s3sink.uploaderPartSizeMb * 1024 * 1024)
+		u.Concurrency = s3sink.uploaderConcurrency
+		u.MaxUploadParts = s3sink.uploaderMaxUploadParts
+	})
 
-	var parts []*s3.CompletedPart
-	var wg sync.WaitGroup
-	for chunkIndex, chunk := range chunkViews {
-		partId := chunkIndex + 1
-		wg.Add(1)
-		go func(chunk *filer2.ChunkView) {
-			defer wg.Done()
-			if part, uploadErr := s3sink.uploadPart(ctx, key, uploadId, partId, chunk); uploadErr != nil {
-				err = uploadErr
-			} else {
-				parts = append(parts, part)
+	if s3sink.keepPartSize {
+		switch chunkCount := len(entry.Chunks); {
+		case chunkCount > 1:
+			if firstChunkSize := int64(entry.Chunks[0].Size); firstChunkSize > s3manager.MinUploadPartSize {
+				uploader.PartSize = firstChunkSize
 			}
-		}(chunk)
+		default:
+			uploader.PartSize = 0
+		}
 	}
-	wg.Wait()
 
+	// process tagging
+	tags := buildTaggingString(entry.Extended)
+
+	// Upload the file to S3.
+	uploadInput := s3manager.UploadInput{
+		Bucket: aws.String(s3sink.bucket),
+		Key:    aws.String(key),
+		Body:   decryptedReader,
+	}
+	if tags != "" {
+		uploadInput.Tagging = aws.String(tags)
+	}
+	metadata := toMetadata(entry.Extended)
+	if _, found := metadata["mtime"]; !found {
+		metadata["mtime"] = aws.String(strconv.FormatInt(entry.Attributes.Mtime, 10))
+	}
+	if size := metadataSize(metadata); size <= maxMetadataSize {
+		uploadInput.Metadata = metadata
+	} else {
+		glog.Warningf("[%s] %s: %d bytes of user metadata exceed the S3 limit of %d, uploading without it", s3sink.bucket, key, size, maxMetadataSize)
+	}
+	if entry.Attributes.Mime != "" {
+		uploadInput.ContentType = aws.String(entry.Attributes.Mime)
+	}
+	if len(entry.Attributes.Md5) > 0 {
+		uploadInput.ContentMD5 = aws.String(base64.StdEncoding.EncodeToString([]byte(entry.Attributes.Md5)))
+	}
+	_, err = uploader.Upload(&uploadInput)
 	if err != nil {
-		s3sink.abortMultipartUpload(key, uploadId)
-		return err
+		if sourceErr := filer.ReaderSourceError(reader); sourceErr != nil {
+			return fmt.Errorf("read source %s: %w", key, sourceErr)
+		}
 	}
 
-	return s3sink.completeMultipartUpload(ctx, key, uploadId, parts)
+	return err
 
 }
 
-func (s3sink *S3Sink) UpdateEntry(ctx context.Context, key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool) (foundExistingEntry bool, err error) {
+func (s3sink *S3Sink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool, signatures []int32) (foundExistingEntry bool, err error) {
 	key = cleanKey(key)
-	// TODO improve efficiency
-	return false, nil
+	return true, s3sink.CreateEntry(key, newEntry, signatures)
 }
 
 func cleanKey(key string) string {
@@ -141,4 +245,53 @@ func cleanKey(key string) string {
 		key = key[1:]
 	}
 	return key
+}
+
+// buildTaggingString builds the S3 Tagging header value from entry extended metadata.
+// Only keys with the AmzObjectTaggingPrefix ("X-Amz-Tagging-") are included as object
+// tags. The prefix is stripped and values are URL-encoded to produce a valid S3 tagging
+// query string.
+func buildTaggingString(extended map[string][]byte) string {
+	tagValues := url.Values{}
+	for k, v := range extended {
+		if strings.HasPrefix(k, s3_constants.AmzObjectTaggingPrefix) {
+			tagKey := k[len(s3_constants.AmzObjectTaggingPrefix):]
+			tagValues.Set(tagKey, string(v))
+		}
+	}
+	return tagValues.Encode()
+}
+
+// toMetadata maps the X-Amz-Meta- attributes, matched case-insensitively for
+// entries written before the S3 gateway canonicalized them, to S3 user metadata.
+// Of keys that differ only in case the lowest wins, so X-Amz-Meta-Foo beats the
+// legacy x-amz-meta-foo. Values that are not printable ASCII are RFC 2047
+// encoded, which S3 decodes.
+func toMetadata(extended map[string][]byte) map[string]*string {
+	prefix := s3_constants.AmzUserMetaPrefix
+	metadata := make(map[string]*string)
+	sourceKeys := make(map[string]string)
+	for k, v := range extended {
+		if len(k) <= len(prefix) || !strings.EqualFold(k[:len(prefix)], prefix) {
+			continue
+		}
+		if !httpguts.ValidHeaderFieldName(k) {
+			glog.Warningf("skip metadata %q: not a valid header name", k)
+			continue
+		}
+		name := strings.ToLower(k[len(prefix):])
+		if seen, found := sourceKeys[name]; found && seen < k {
+			continue
+		}
+		sourceKeys[name] = k
+		metadata[name] = aws.String(mime.QEncoding.Encode("utf-8", string(v)))
+	}
+	return metadata
+}
+
+func metadataSize(metadata map[string]*string) (size int) {
+	for k, v := range metadata {
+		size += len(k) + len(*v)
+	}
+	return size
 }

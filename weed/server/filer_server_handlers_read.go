@@ -2,268 +2,480 @@ package weed_server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"mime"
-	"mime/multipart"
 	"net/http"
-	"net/url"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, isGetMethod bool) {
+// Validates the preconditions. Returns true if GET/HEAD operation should not proceed.
+// Preconditions supported are:
+//
+//	If-Modified-Since
+//	If-Unmodified-Since
+//	If-Match
+//	If-None-Match
+func checkPreconditions(w http.ResponseWriter, r *http.Request, entry *filer.Entry) bool {
+
+	etag := filer.ETagEntry(entry)
+	/// When more than one conditional request header field is present in a
+	/// request, the order in which the fields are evaluated becomes
+	/// important.  In practice, the fields defined in this document are
+	/// consistently implemented in a single, logical order, since "lost
+	/// update" preconditions have more strict requirements than cache
+	/// validation, a validated cache is more efficient than a partial
+	/// response, and entity tags are presumed to be more accurate than date
+	/// validators. https://tools.ietf.org/html/rfc7232#section-5
+	if entry.Attr.Mtime.IsZero() {
+		return false
+	}
+	w.Header().Set("Last-Modified", entry.Attr.Mtime.UTC().Format(http.TimeFormat))
+
+	ifMatchValues := r.Header.Values("If-Match")
+	ifUnmodifiedSinceHeader := r.Header.Get("If-Unmodified-Since")
+	if len(ifMatchValues) != 0 {
+		if !etagListMatches(strings.Join(ifMatchValues, ","), etag, false) {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return true
+		}
+	} else if ifUnmodifiedSinceHeader != "" {
+		if t, parseError := time.Parse(http.TimeFormat, ifUnmodifiedSinceHeader); parseError == nil {
+			if t.Before(entry.Attr.Mtime) {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return true
+			}
+		}
+	}
+
+	ifNoneMatchValues := r.Header.Values("If-None-Match")
+	ifModifiedSinceHeader := r.Header.Get("If-Modified-Since")
+	if len(ifNoneMatchValues) != 0 {
+		if etagListMatches(strings.Join(ifNoneMatchValues, ","), etag, true) {
+			SetEtag(w, etag)
+			w.WriteHeader(http.StatusNotModified)
+			return true
+		}
+	} else if ifModifiedSinceHeader != "" {
+		if t, parseError := time.Parse(http.TimeFormat, ifModifiedSinceHeader); parseError == nil {
+			if !t.Before(entry.Attr.Mtime) {
+				SetEtag(w, etag)
+				w.WriteHeader(http.StatusNotModified)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// etagListMatches reports whether an If-Match or If-None-Match value, "*" or a
+// list of entity tags, matches etag (RFC 9110 13.1.1, 13.1.2). If-Match uses the
+// strong comparison, so a weak tag never matches; If-None-Match the weak one.
+func etagListMatches(header, etag string, weak bool) bool {
+	if strings.TrimSpace(header) == "*" {
+		return true
+	}
+	for _, tag := range splitETagList(header) {
+		tag = strings.TrimSpace(tag)
+		if strings.HasPrefix(tag, "W/") {
+			if !weak {
+				continue
+			}
+			tag = tag[len("W/"):]
+		}
+		// Empty list elements are ignored, so padding like a trailing
+		// comma cannot match an empty opaque tag.
+		if tag == "" {
+			continue
+		}
+		if util.CanonicalizeETag(tag) == util.CanonicalizeETag(etag) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitETagList splits an entity-tag list on the commas between tags; a comma
+// inside a quoted opaque tag does not split.
+func splitETagList(header string) []string {
+	var tags []string
+	start, quoted := 0, false
+	for i := 0; i < len(header); i++ {
+		switch header[i] {
+		case '"':
+			quoted = !quoted
+		case ',':
+			if !quoted {
+				tags = append(tags, header[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(tags, header[start:])
+}
+
+func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	path := r.URL.Path
-	if strings.HasSuffix(path, "/") && len(path) > 1 {
+	isForDirectory := strings.HasSuffix(path, "/")
+	if isForDirectory && len(path) > 1 {
 		path = path[:len(path)-1]
 	}
 
-	entry, err := fs.filer.FindEntry(context.Background(), filer2.FullPath(path))
+	entry, err := fs.filer.FindEntry(ctx, util.FullPath(path))
 	if err != nil {
 		if path == "/" {
 			fs.listDirectoryHandler(w, r)
 			return
 		}
-		glog.V(1).Infof("Not found %s: %v", path, err)
-		w.WriteHeader(http.StatusNotFound)
+		if err == filer_pb.ErrNotFound {
+			glog.V(2).InfofCtx(ctx, "Not found %s: %v", path, err)
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadNotFound).Inc()
+			w.WriteHeader(http.StatusNotFound)
+		} else {
+			glog.ErrorfCtx(ctx, "Internal %s: %v", path, err)
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadInternal).Inc()
+			w.WriteHeader(http.StatusInternalServerError)
+		}
 		return
 	}
 
+	query := r.URL.Query()
+
 	if entry.IsDirectory() {
 		if fs.option.DisableDirListing {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			w.WriteHeader(http.StatusForbidden)
 			return
 		}
+		if query.Get("metadata") == "true" {
+			writeJsonQuiet(w, r, http.StatusOK, entry)
+			return
+		}
+		// listDirectoryHandler checks ExposeDirectoryData internally
 		fs.listDirectoryHandler(w, r)
 		return
 	}
 
-	if len(entry.Chunks) == 0 {
-		glog.V(1).Infof("no file chunks for %s, attr=%+v", path, entry.Attr)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	w.Header().Set("Accept-Ranges", "bytes")
-	if r.Method == "HEAD" {
-		w.Header().Set("Content-Length", strconv.FormatInt(int64(filer2.TotalSize(entry.Chunks)), 10))
-		w.Header().Set("Last-Modified", entry.Attr.Mtime.Format(http.TimeFormat))
-		setEtag(w, filer2.ETag(entry.Chunks))
-		return
-	}
-
-	if len(entry.Chunks) == 1 {
-		fs.handleSingleChunk(w, r, entry)
-		return
-	}
-
-	fs.handleMultipleChunks(w, r, entry)
-
-}
-
-func (fs *FilerServer) handleSingleChunk(w http.ResponseWriter, r *http.Request, entry *filer2.Entry) {
-
-	fileId := entry.Chunks[0].FileId
-
-	urlString, err := fs.filer.MasterClient.LookupFileId(fileId)
-	if err != nil {
-		glog.V(1).Infof("operation LookupFileId %s failed, err: %v", fileId, err)
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	if fs.option.RedirectOnRead {
-		http.Redirect(w, r, urlString, http.StatusFound)
-		return
-	}
-
-	u, _ := url.Parse(urlString)
-	q := u.Query()
-	for key, values := range r.URL.Query() {
-		for _, value := range values {
-			q.Add(key, value)
+	if query.Get("metadata") == "true" {
+		if query.Get("resolveManifest") == "true" {
+			if entry.Chunks, _, err = filer.ResolveChunkManifest(
+				ctx,
+				fs.filer.MasterClient.GetLookupFileIdFunction(),
+				entry.GetChunks(), 0, math.MaxInt64, fs.filer.MasterClient); err != nil {
+				err = fmt.Errorf("failed to resolve chunk manifest, err: %s", err.Error())
+				writeJsonError(w, r, http.StatusInternalServerError, err)
+				return
+			}
 		}
-	}
-	u.RawQuery = q.Encode()
-	request := &http.Request{
-		Method:        r.Method,
-		URL:           u,
-		Proto:         r.Proto,
-		ProtoMajor:    r.ProtoMajor,
-		ProtoMinor:    r.ProtoMinor,
-		Header:        r.Header,
-		Body:          r.Body,
-		Host:          r.Host,
-		ContentLength: r.ContentLength,
-	}
-	glog.V(3).Infoln("retrieving from", u)
-	resp, do_err := util.Do(request)
-	if do_err != nil {
-		glog.V(0).Infoln("failing to connect to volume server", do_err.Error())
-		writeJsonError(w, r, http.StatusInternalServerError, do_err)
+		writeJsonQuiet(w, r, http.StatusOK, entry)
 		return
 	}
-	defer func() {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	if entry.Attr.Mime != "" {
-		w.Header().Set("Content-Type", entry.Attr.Mime)
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
 
-func (fs *FilerServer) handleMultipleChunks(w http.ResponseWriter, r *http.Request, entry *filer2.Entry) {
+	if checkPreconditions(w, r, entry) {
+		return
+	}
 
+	// Generate ETag for response
+	etag := filer.ETagEntry(entry)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	// mime type
 	mimeType := entry.Attr.Mime
 	if mimeType == "" {
-		if ext := path.Ext(entry.Name()); ext != "" {
+		if ext := filepath.Ext(entry.Name()); ext != "" {
 			mimeType = mime.TypeByExtension(ext)
 		}
 	}
 	if mimeType != "" {
 		w.Header().Set("Content-Type", mimeType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	setEtag(w, filer2.ETag(entry.Chunks))
 
-	totalSize := int64(filer2.TotalSize(entry.Chunks))
+	// print out the header from extended properties
+	// Filter out xattr-* (filesystem extended attributes) and internal SeaweedFS headers
+	for k, v := range entry.Extended {
+		if !strings.HasPrefix(k, "xattr-") && !s3_constants.IsSeaweedFSInternalHeader(k) {
+			w.Header().Set(k, string(v))
+		}
+	}
 
-	rangeReq := r.Header.Get("Range")
+	//Seaweed custom header are not visible to Vue or javascript
+	seaweedHeaders := []string{}
+	for header := range w.Header() {
+		if strings.HasPrefix(header, "Seaweed-") {
+			seaweedHeaders = append(seaweedHeaders, header)
+		}
+	}
+	seaweedHeaders = append(seaweedHeaders, "Content-Disposition")
+	w.Header().Set("Access-Control-Expose-Headers", strings.Join(seaweedHeaders, ","))
 
-	if rangeReq == "" {
+	SetEtag(w, etag)
+
+	filename := entry.Name()
+	AdjustPassthroughHeaders(w, r, filename)
+
+	// For range processing, use the original content size, not the encrypted size
+	// entry.Size() returns max(chunk_sizes, file_size) where chunk_sizes include encryption overhead
+	// For SSE objects, we need the original unencrypted size for proper range validation
+	totalSize := int64(entry.FileSize)
+
+	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
-		if err := fs.writeContent(w, entry, 0, int(totalSize)); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		return
 	}
 
-	//the rest is dealing with partial content request
-	//mostly copy from src/pkg/net/http/fs.go
-	ranges, err := parseRange(rangeReq, totalSize)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-	if sumRangesSize(ranges) > totalSize {
-		// The total number of bytes in all the ranges
-		// is larger than the size of the file by
-		// itself, so this is probably an attack, or a
-		// dumb client.  Ignore the range request.
-		return
-	}
-	if len(ranges) == 0 {
-		return
-	}
-	if len(ranges) == 1 {
-		// RFC 2616, Section 14.16:
-		// "When an HTTP message includes the content of a single
-		// range (for example, a response to a request for a
-		// single range, or to a request for a set of ranges
-		// that overlap without any holes), this content is
-		// transmitted with a Content-Range header, and a
-		// Content-Length header showing the number of bytes
-		// actually transferred.
-		// ...
-		// A response to a request for a single range MUST NOT
-		// be sent using the multipart/byteranges media type."
-		ra := ranges[0]
-		w.Header().Set("Content-Length", strconv.FormatInt(ra.length, 10))
-		w.Header().Set("Content-Range", ra.contentRange(totalSize))
-		w.WriteHeader(http.StatusPartialContent)
-
-		err = fs.writeContent(w, entry, ra.start, int(ra.length))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		return
+	if entry.Remote != nil && entry.Remote.RemoteSize > 0 {
+		// inline content is served locally without chunks
+		hit := !entry.IsInRemoteOnly() || len(entry.Content) > 0
+		stats.RecordRemoteCacheRead(stats.RemoteCacheSourceFiler, fs.filer.DetectBucket(entry.FullPath), hit)
 	}
 
-	// process multiple ranges
-	for _, ra := range ranges {
-		if ra.start > totalSize {
-			http.Error(w, "Out of Range", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-	}
-	sendSize := rangesMIMESize(ranges, mimeType, totalSize)
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
-	sendContent := pr
-	defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
-	go func() {
-		for _, ra := range ranges {
-			part, e := mw.CreatePart(ra.mimeHeader(mimeType, totalSize))
-			if e != nil {
-				pw.CloseWithError(e)
-				return
+	// Every part of a multipart Range is prepared on its own, so the origin
+	// preflight below is memoized to one stat per request.
+	statOriginAt := func(readDir, readName string) func() error {
+		return sync.OnceValue(func() error {
+			client, remoteLocation, err := fs.mountedRemoteClient(ctx, readDir, readName)
+			if err != nil {
+				return err
 			}
-			if e = fs.writeContent(part, entry, ra.start, int(ra.length)); e != nil {
-				pw.CloseWithError(e)
-				return
-			}
-		}
-		mw.Close()
-		pw.Close()
-	}()
-	if w.Header().Get("Content-Encoding") == "" {
-		w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
-	}
-	w.WriteHeader(http.StatusPartialContent)
-	if _, err := io.CopyN(w, sendContent, sendSize); err != nil {
-		http.Error(w, "Internal Error", http.StatusInternalServerError)
-		return
-	}
-
-}
-
-func (fs *FilerServer) writeContent(w io.Writer, entry *filer2.Entry, offset int64, size int) error {
-
-	return StreamContent(fs.filer.MasterClient, w, entry.Chunks, offset, size)
-
-}
-
-func StreamContent(masterClient *wdclient.MasterClient, w io.Writer, chunks []*filer_pb.FileChunk, offset int64, size int) error {
-
-	chunkViews := filer2.ViewFromChunks(chunks, offset, size)
-
-	fileId2Url := make(map[string]string)
-
-	for _, chunkView := range chunkViews {
-
-		urlString, err := masterClient.LookupFileId(chunkView.FileId)
-		if err != nil {
-			glog.V(1).Infof("operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
+			_, err = client.StatFile(remoteLocation)
 			return err
-		}
-		fileId2Url[chunkView.FileId] = urlString
-	}
-
-	for _, chunkView := range chunkViews {
-		urlString := fileId2Url[chunkView.FileId]
-		_, err := util.ReadUrlAsStream(urlString, chunkView.Offset, int(chunkView.Size), func(data []byte) {
-			w.Write(data)
 		})
-		if err != nil {
-			glog.V(1).Infof("read %s failed, err: %v", chunkView.FileId, err)
-			return err
-		}
 	}
+	entryDir, entryName := entry.FullPath.DirAndName()
+	statOrigin := statOriginAt(fs.filer.RemoteReadPath(entry, entryDir, entryName))
 
-	return nil
+	ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
+		if offset+size <= int64(len(entry.Content)) {
+			return func(writer io.Writer) error {
+				_, err := writer.Write(entry.Content[offset : offset+size])
+				if err != nil {
+					stats.FilerHandlerCounter.WithLabelValues(stats.ErrorWriteEntry).Inc()
+					glog.ErrorfCtx(ctx, "failed to write entry content: %v", err)
+				}
+				return err
+			}, nil
+		}
+		chunks := entry.GetChunks()
+		if entry.IsInRemoteOnly() {
+			dir, name := entry.FullPath.DirAndName()
+			readDir, readName := fs.filer.RemoteReadPath(entry, dir, name)
+			var mountedLocation *remote_pb.RemoteStorageLocation
+			if fs.filer.RemoteStorage != nil {
+				_, mountedLocation = fs.filer.RemoteStorage.FindMountDirectory(entry.FullPath)
+			}
+			cacheWait := remote_storage.CacheWaitTimeout(entry.Remote.RemoteSize, mountedLocation)
+			if cacheWait <= 0 {
+				streamFn, err := fs.streamFromRemoteOnly(ctx, r, readDir, readName, offset, size, statOrigin)
+				if errors.Is(err, filer_pb.ErrNotFound) && (readDir != dir || readName != name) {
+					// the pending copy finished and its source went away since
+					// the entry was read; serve what the entry names now
+					if fresh, findErr := fs.filer.FindEntry(ctx, entry.FullPath); findErr == nil {
+						freshDir, freshName := fs.filer.RemoteReadPath(fresh, dir, name)
+						return fs.streamFromRemoteOnly(ctx, r, freshDir, freshName, offset, size, statOriginAt(freshDir, freshName))
+					}
+				}
+				return streamFn, err
+			}
+			// Bounded wait: a large download outlasts any client timeout, so
+			// serve straight from the origin once the wait expires while the
+			// detached cache keeps filling for later reads.
+			cacheCtx, cancelCache := context.WithTimeout(ctx, cacheWait)
+			resp, err := fs.CacheRemoteObjectToLocalCluster(cacheCtx, &filer_pb.CacheRemoteObjectToLocalClusterRequest{
+				Directory: dir,
+				Name:      name,
+			})
+			cancelCache()
+			if err != nil {
+				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadCache).Inc()
+				// Client disconnected: surface ctx error so caller stays silent.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				// Entry vanished mid-cache: forward the sentinel so caller maps to
+				// 404, not the 503 retry-loop. The cache RPC returns it as a
+				// canonical status, which errors.Is cannot see.
+				if errors.Is(err, filer_pb.ErrNotFound) || status.Code(err) == codes.NotFound {
+					return nil, filer_pb.ErrNotFound
+				}
+				// A multipart Range prepares every part before writing any, which
+				// would hold one open origin connection per part and leak them
+				// when a later prepare fails; keep those on the 503 retry path.
+				if !strings.Contains(r.Header.Get("Range"), ",") {
+					glog.V(1).InfofCtx(ctx, "stream %s from remote while caching: %v", entry.FullPath, err)
+					if streamFn, remoteErr := fs.streamFromRemote(ctx, readDir, readName, offset, size); remoteErr == nil {
+						return streamFn, nil
+					} else {
+						glog.WarningfCtx(ctx, "stream %s from remote: %v", entry.FullPath, remoteErr)
+					}
+				}
+				// Origin unreadable: tag with sentinel so caller maps to 503 + Retry-After.
+				glog.WarningfCtx(ctx, "CacheRemoteObjectToLocalCluster %s: %v", entry.FullPath, err)
+				return nil, fmt.Errorf("cache %s: %w", entry.FullPath, ErrCacheNotReady)
+			}
+			chunks = resp.Entry.GetChunks()
+		}
 
+		// Use a detached context for streaming so client disconnects/cancellations don't abort volume server operations,
+		// while preserving request-scoped values like tracing IDs.
+		// Matches S3 API behavior. Request context (ctx) is used for metadata operations above.
+		streamCtx, streamCancel := context.WithCancel(context.WithoutCancel(ctx))
+
+		streamFn, err := filer.PrepareStreamContentWithPrefetch(streamCtx, fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs, 4)
+		if err != nil {
+			streamCancel()
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+			glog.ErrorfCtx(ctx, "failed to prepare stream content %s: %v", r.URL, err)
+			return nil, err
+		}
+		return func(writer io.Writer) error {
+			defer streamCancel()
+			err := streamFn(writer)
+			if err != nil {
+				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+				glog.ErrorfCtx(ctx, "failed to stream content %s: %v", r.URL, err)
+			}
+			return err
+		}, nil
+	})
+}
+
+// streamFromRemoteOnly serves a byte range of an entry whose mount opted out of
+// caching, leaving the origin as its only source. A multipart Range prepares
+// every part before writing any, so those open the origin at write time instead
+// of holding one connection per part through the whole preparation.
+func (fs *FilerServer) streamFromRemoteOnly(ctx context.Context, r *http.Request, dir, name string, offset, size int64, statOrigin func() error) (filer.DoStreamContent, error) {
+	fullPath := util.FullPath(dir).Child(name)
+	if strings.Contains(r.Header.Get("Range"), ",") {
+		// Stat first so a missing or unreachable origin still picks the response
+		// status, which the multipart body would otherwise have committed.
+		if err := statOrigin(); err != nil {
+			return nil, fs.remoteReadError(ctx, fullPath, err)
+		}
+		return func(writer io.Writer) error {
+			streamFn, remoteErr := fs.streamFromRemote(ctx, dir, name, offset, size)
+			if remoteErr != nil {
+				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+				return remoteErr
+			}
+			return streamFn(writer)
+		}, nil
+	}
+	streamFn, remoteErr := fs.streamFromRemote(ctx, dir, name, offset, size)
+	if remoteErr != nil {
+		return nil, fs.remoteReadError(ctx, fullPath, remoteErr)
+	}
+	return streamFn, nil
+}
+
+// remoteReadError maps a failed origin read of an uncachable entry onto the
+// sentinel the caller turns into a response: a vanished object is final, since
+// no cache can resurrect it, while anything else may pass.
+func (fs *FilerServer) remoteReadError(ctx context.Context, fullPath util.FullPath, err error) error {
+	stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+	glog.WarningfCtx(ctx, "read %s from remote: %v", fullPath, err)
+	if errors.Is(err, remote_storage.ErrRemoteObjectNotFound) {
+		return filer_pb.ErrNotFound
+	}
+	return fmt.Errorf("read %s: %w", fullPath, ErrCacheNotReady)
+}
+
+// mountedRemoteClient resolves the origin of dir/name into a client that can
+// stream it.
+func (fs *FilerServer) mountedRemoteClient(ctx context.Context, dir, name string) (remote_storage.RemoteStorageClient, *remote_pb.RemoteStorageLocation, error) {
+	storageConf, remoteLocation, err := fs.resolveMountedRemote(ctx, dir, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := BuildGuardedRemoteStorageClient(ctx, storageConf, fs.option.AllowUntrustedRemoteEndpoints)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, ok := client.(remote_storage.RemoteStorageStreamReader); !ok {
+		return nil, nil, fmt.Errorf("remote storage type %s does not support streaming reads", storageConf.Type)
+	}
+	return client, remoteLocation, nil
+}
+
+// streamFromRemote serves a byte range of a remote-only entry straight from the
+// mounted origin, so a first read is not blocked by the full local caching.
+func (fs *FilerServer) streamFromRemote(ctx context.Context, dir, name string, offset, size int64) (filer.DoStreamContent, error) {
+	client, remoteLocation, err := fs.mountedRemoteClient(ctx, dir, name)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := client.(remote_storage.RemoteStorageStreamReader).ReadFileAsStream(ctx, remoteLocation, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	downloadThrottler := util.NewWriteThrottler(fs.option.DownloadMaxBytesPs)
+	return func(writer io.Writer) error {
+		defer reader.Close()
+		var written int64
+		buf := make([]byte, 128*1024)
+		for {
+			n, readErr := reader.Read(buf)
+			if n > 0 {
+				if _, writeErr := writer.Write(buf[:n]); writeErr != nil {
+					return writeErr
+				}
+				written += int64(n)
+				downloadThrottler.MaybeSlowdown(int64(n))
+			}
+			if readErr == io.EOF {
+				if written != size {
+					// the origin returned fewer bytes than the entry's RemoteSize
+					return fmt.Errorf("origin stream %s: %w after %d of %d bytes", remoteLocation.Path, io.ErrUnexpectedEOF, written, size)
+				}
+				return nil
+			}
+			if readErr != nil {
+				return readErr
+			}
+		}
+	}, nil
+}
+
+func (fs *FilerServer) maybeGetVolumeReadJwtAuthorizationToken(fileId string) string {
+	// Only ever sign with the read key. A volume server enforces read JWTs
+	// solely when jwt.signing.read.key is set, so falling back to the write key
+	// buys no access on a read -- it only hands out a token that would authorize
+	// a write.
+	return fs.maybeGetVolumeJwtAuthorizationToken(fileId, false)
+}
+
+// maybeGetVolumeJwtAuthorizationToken mints the volume credential for one file
+// id at the requested access level, empty when that key is unset -- which is
+// also when the volume server asks for nothing.
+func (fs *FilerServer) maybeGetVolumeJwtAuthorizationToken(fileId string, isWrite bool) string {
+	key, expiresAfterSec := fs.volumeGuard.ReadSigningKey(), fs.volumeGuard.ReadExpiresAfterSec()
+	if isWrite {
+		key, expiresAfterSec = fs.volumeGuard.SigningKey(), fs.volumeGuard.ExpiresAfterSec()
+	}
+	if len(key) == 0 {
+		return ""
+	}
+	// Claim the base fid: the volume server strips a _N delta suffix before
+	// comparing, so a token claiming the suffixed form never matches.
+	return string(security.GenJwtForVolumeServer(key, expiresAfterSec, baseFileId(fileId)))
 }

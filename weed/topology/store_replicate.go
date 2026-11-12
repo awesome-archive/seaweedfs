@@ -1,7 +1,7 @@
 package topology
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,37 +9,131 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"google.golang.org/grpc"
 )
 
-func ReplicatedWrite(masterNode string, s *storage.Store,
-	volumeId needle.VolumeId, n *needle.Needle,
-	r *http.Request) (size uint32, isUnchanged bool, err error) {
+var ErrorWriteRefused = errors.New("write refused before append")
+
+// ReplicatedWrite writes a needle to the local volume and fans it out to all
+// remote replica locations. When type=replicate is set, the request is itself
+// a forwarded replication and no further remote lookups are performed.
+// Returns isUnchanged=true when the local write determined the needle content
+// was already present.
+func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, s *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request, contentMd5 string) (isUnchanged bool, err error) {
 
 	//check JWT
 	jwt := security.GetJwt(r)
 
-	size, isUnchanged, err = s.Write(volumeId, n)
-	if err != nil {
-		err = fmt.Errorf("failed to write to local disk: %v", err)
+	// check whether this is a replicated write request
+	var remoteLocations []operation.Location
+	if r.FormValue("type") != "replicate" {
+		// this is the initial request
+		remoteLocations, err = GetWritableRemoteReplications(s, grpcDialOption, volumeId, masterFn)
+		if err != nil {
+			glog.V(0).Infoln(err)
+			return
+		}
+	}
+
+	// with no local volume and no replica to forward to, the write would be acknowledged without being stored
+	vol := s.GetVolume(volumeId)
+	if vol == nil && len(remoteLocations) == 0 {
+		err = fmt.Errorf("volume %d not found on %s:%d", volumeId, s.Ip, s.Port)
+		glog.V(0).Infoln(err)
 		return
 	}
 
-	needToReplicate := !s.HasVolume(volumeId)
-	needToReplicate = needToReplicate || s.GetVolume(volumeId).NeedToReplicate()
-	if !needToReplicate {
-		needToReplicate = s.GetVolume(volumeId).NeedToReplicate()
+	// read fsync value
+	fsync := false
+	if r.FormValue("fsync") == "true" {
+		fsync = true
 	}
-	if needToReplicate { //send to other replica locations
-		if r.FormValue("type") != "replicate" {
 
-			if err = distributedOperation(masterNode, s, volumeId, func(location operation.Location) error {
+	replicaCount := len(remoteLocations)
+
+	if replicaCount > 0 {
+		// Record replication duration histogram for the overall write operation
+		defer func(t time.Time) {
+			stats.VolumeServerReplicationHistogram.WithLabelValues(stats.ReplicationOpWrite).Observe(time.Since(t).Seconds())
+		}(time.Now())
+	}
+
+	// Snapshot the fields the fan-out reads before the concurrent local write
+	// mutates the needle (it stamps the volume TTL and flags), so the two cannot
+	// race; the fan-out then touches only these locals plus read-only n.Data.
+	replicaTtl := n.Ttl
+	if vol != nil && replicaTtl == needle.EMPTY_TTL && vol.Ttl != needle.EMPTY_TTL {
+		replicaTtl = vol.Ttl
+	}
+	replicaLastModified := n.LastModified
+	replicaIsChunked := n.IsChunkedManifest()
+	replicaIsCompressed := n.IsCompressed()
+	replicaName := string(n.Name)
+	replicaMime := string(n.Mime)
+	replicaData := n.Data
+	replicaPairMap := make(map[string]string)
+	if replicaCount > 0 && n.HasPairs() {
+		tmpMap := make(map[string]string)
+		if pe := json.Unmarshal(n.Pairs, &tmpMap); pe != nil {
+			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorUnmarshalPairs).Inc()
+			glog.V(0).Infoln("Unmarshal pairs error:", pe)
+		}
+		for k, v := range tmpMap {
+			replicaPairMap[needle.PairNamePrefix+k] = v
+		}
+	}
+
+	// Observe replication targets histogram for all operations (including zero)
+	stats.VolumeServerReplicationTargets.Observe(float64(replicaCount))
+
+	// Run the local disk write and the replica fan-out concurrently against the
+	// buffered needle (latency max(local, replicas), not the sum); ack after both.
+	var wg sync.WaitGroup
+	var localErr, remoteErr error
+	var localIsUnchanged bool
+
+	if vol != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			inFlightGauge := stats.VolumeServerInFlightRequestsGauge.WithLabelValues(stats.WriteToLocalDisk)
+			inFlightGauge.Inc()
+			defer inFlightGauge.Dec()
+
+			localIsUnchanged, localErr = s.WriteVolumeNeedle(volumeId, n, true, fsync)
+			stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToLocalDisk).Observe(time.Since(start).Seconds())
+			if localErr != nil {
+				stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorWriteToLocalDisk).Inc()
+				localErr = fmt.Errorf("failed to write to local disk: %w", localErr)
+				glog.V(0).Infoln(localErr)
+			}
+		}()
+	}
+
+	if replicaCount > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			inFlightGauge := stats.VolumeServerInFlightRequestsGauge.WithLabelValues(stats.WriteToReplicas)
+			inFlightGauge.Inc()
+			defer inFlightGauge.Dec()
+
+			remoteErr = DistributedOperation(ctx, remoteLocations, func(ctx context.Context, location operation.Location) error {
 				u := url.URL{
 					Scheme: "http",
 					Host:   location.Url,
@@ -47,116 +141,299 @@ func ReplicatedWrite(masterNode string, s *storage.Store,
 				}
 				q := url.Values{
 					"type": {"replicate"},
-					"ttl":  {n.Ttl.String()},
+					"ttl":  {replicaTtl.String()},
 				}
-				if n.LastModified > 0 {
-					q.Set("ts", strconv.FormatUint(n.LastModified, 10))
+				if fsync {
+					q.Set("fsync", "true")
 				}
-				if n.IsChunkedManifest() {
+				if replicaLastModified > 0 {
+					q.Set("ts", strconv.FormatUint(replicaLastModified, 10))
+				}
+				if replicaIsChunked {
 					q.Set("cm", "true")
 				}
 				u.RawQuery = q.Encode()
 
-				pairMap := make(map[string]string)
-				if n.HasPairs() {
-					tmpMap := make(map[string]string)
-					err := json.Unmarshal(n.Pairs, &tmpMap)
-					if err != nil {
-						glog.V(0).Infoln("Unmarshal pairs error:", err)
-					}
-					for k, v := range tmpMap {
-						pairMap[needle.PairNamePrefix+k] = v
-					}
+				bytesBuffer := buffer_pool.SyncPoolGetBuffer()
+				defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
+
+				// volume server do not know about encryption
+				uploadOption := &operation.UploadOption{
+					UploadUrl:         u.String(),
+					Filename:          replicaName,
+					Cipher:            false,
+					IsInputCompressed: replicaIsCompressed,
+					IsReplication:     true,
+					MimeType:          replicaMime,
+					PairMap:           replicaPairMap,
+					Jwt:               jwt,
+					Md5:               contentMd5,
+					BytesBuffer:       bytesBuffer,
+					MaxAttempts:       1, // fail fast on a dead replica; the client write retries
 				}
 
-				_, err := operation.Upload(u.String(),
-					string(n.Name), bytes.NewReader(n.Data), n.IsGzipped(), string(n.Mime),
-					pairMap, jwt)
-				return err
-			}); err != nil {
-				size = 0
-				err = fmt.Errorf("failed to write to replicas for volume %d: %v", volumeId, err)
+				uploader, uploaderErr := operation.NewUploader()
+				if uploaderErr != nil {
+					glog.Errorf("replication-UploadData, err:%v, url:%s", uploaderErr, u.String())
+					return uploaderErr
+				}
+				uploadErr := replicateTo(ctx, uploader, replicaData, uploadOption)
+				if uploadErr != nil {
+					glog.Errorf("replication-UploadData, err:%v, url:%s", uploadErr, u.String())
+				}
+				return uploadErr
+			})
+			stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToReplicas).Observe(time.Since(start).Seconds())
+			if remoteErr != nil {
+				stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorWriteToReplicas).Inc()
+				stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpWrite, stats.ReplicationFailure).Inc()
+				reason := classifyReplicationError(remoteErr)
+				stats.VolumeServerReplicationFailures.WithLabelValues(stats.ReplicationOpWrite, reason).Inc()
+				remoteErr = fmt.Errorf("failed to write to replicas for volume %d: %v", volumeId, remoteErr)
+				glog.V(0).Infoln(remoteErr)
+			} else {
+				stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpWrite, stats.ReplicationSuccess).Inc()
 			}
+		}()
+	}
+
+	wg.Wait()
+
+	if localErr != nil {
+		if errors.Is(localErr, storage.ErrorReadOnly) && replicaCount == 0 && !fsync && r.FormValue("type") != "replicate" {
+			localErr = fmt.Errorf("%w: %w", ErrorWriteRefused, localErr)
+		}
+		return false, localErr
+	}
+	if remoteErr != nil {
+		return false, remoteErr
+	}
+	return localIsUnchanged, nil
+}
+
+// replicaRequestTimeout bounds one replica forward with no body, from connect
+// to the end of the response, so a silently partitioned peer cannot hold the
+// write. Mirrors the Rust volume server's REPLICA_REQUEST_TIMEOUT.
+var replicaRequestTimeout = 10 * time.Second
+
+// replicaMinBytesPerSec is the slowest link a forward's body may cross within
+// its bound, so a large write is not cut off on a link slower than a LAN.
+const replicaMinBytesPerSec = 1 << 20
+
+func replicaRequestBound(size int) time.Duration {
+	return replicaRequestTimeout + time.Duration(int64(size)*1000/replicaMinBytesPerSec)*time.Millisecond
+}
+
+func replicateTo(ctx context.Context, uploader *operation.Uploader, data []byte, option *operation.UploadOption) error {
+	bound := replicaRequestBound(len(data))
+	ctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	_, err := uploader.UploadData(ctx, data, option)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w after %v: %v", context.DeadlineExceeded, bound, err)
+	}
+	return err
+}
+
+// ReplicatedDelete deletes a needle from the local volume and sends delete
+// requests to all remote replica locations. Replica deletes use
+// context.Background() so that a client disconnect does not orphan replica
+// deletes.
+func ReplicatedDelete(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, store *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request) (size types.Size, err error) {
+
+	//check JWT
+	jwt := security.GetJwt(r)
+
+	var remoteLocations []operation.Location
+	if r.FormValue("type") != "replicate" {
+		remoteLocations, err = GetRemoteReplications(store, grpcDialOption, volumeId, masterFn)
+		if err != nil {
+			glog.V(0).Infoln(err)
+			return
+		}
+	}
+
+	replicaCount := len(remoteLocations)
+
+	if replicaCount > 0 {
+		// Record replication duration and operation counter for delete
+		defer func(t time.Time) {
+			stats.VolumeServerReplicationHistogram.WithLabelValues(stats.ReplicationOpDelete).Observe(time.Since(t).Seconds())
+			if err != nil {
+				stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpDelete, stats.ReplicationFailure).Inc()
+			} else {
+				stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpDelete, stats.ReplicationSuccess).Inc()
+			}
+		}(time.Now())
+	}
+
+	size, err = store.DeleteVolumeNeedle(volumeId, n)
+	if err != nil {
+		glog.V(0).Infoln("delete error:", err)
+		return
+	}
+
+	// Observe replication targets histogram for all operations (including zero)
+	stats.VolumeServerReplicationTargets.Observe(float64(replicaCount))
+
+	if replicaCount > 0 { //send to other replica locations
+		// background, not r.Context(): a client disconnect must not orphan replica deletes
+		if err = DistributedOperation(context.Background(), remoteLocations, func(ctx context.Context, location operation.Location) error {
+			url, normalizeErr := util_http.GetGlobalHttpClient().NormalizeHttpScheme(location.Url + r.URL.Path + "?type=replicate")
+			if normalizeErr != nil {
+				return normalizeErr
+			}
+			if jwt != "" && (!strings.HasPrefix(url, "https://") || !util_http.GetGlobalHttpClient().IsTLSVerified()) {
+				return fmt.Errorf("refusing to forward delete authorization to %s without HTTPS", location.Url)
+			}
+			return util_http.Delete(url, string(jwt))
+		}); err != nil {
+			reason := classifyReplicationError(err)
+			stats.VolumeServerReplicationFailures.WithLabelValues(stats.ReplicationOpDelete, reason).Inc()
+			size = 0
 		}
 	}
 	return
 }
 
-func ReplicatedDelete(masterNode string, store *storage.Store,
-	volumeId needle.VolumeId, n *needle.Needle,
-	r *http.Request) (uint32, error) {
-
-	//check JWT
-	jwt := security.GetJwt(r)
-
-	ret, err := store.Delete(volumeId, n)
-	if err != nil {
-		glog.V(0).Infoln("delete error:", err)
-		return ret, err
-	}
-
-	needToReplicate := !store.HasVolume(volumeId)
-	if !needToReplicate && ret > 0 {
-		needToReplicate = store.GetVolume(volumeId).NeedToReplicate()
-	}
-	if needToReplicate { //send to other replica locations
-		if r.FormValue("type") != "replicate" {
-			if err = distributedOperation(masterNode, store, volumeId, func(location operation.Location) error {
-				return util.Delete("http://"+location.Url+r.URL.Path+"?type=replicate", string(jwt))
-			}); err != nil {
-				ret = 0
-			}
-		}
-	}
-	return ret, err
-}
-
 type DistributedOperationResult map[string]error
 
 func (dr DistributedOperationResult) Error() error {
-	var errs []string
+	var msgs []string
+	var errs []error
 	for k, v := range dr {
 		if v != nil {
-			errs = append(errs, fmt.Sprintf("[%s]: %v", k, v))
+			msgs = append(msgs, fmt.Sprintf("[%s]: %v", k, v))
+			errs = append(errs, v)
 		}
 	}
 	if len(errs) == 0 {
 		return nil
 	}
-	return errors.New(strings.Join(errs, "\n"))
+	return &distributedOperationError{msg: strings.Join(msgs, "\n"), errs: errs}
 }
+
+// distributedOperationError keeps each replica's error reachable through
+// errors.Is, so a forward that hit its bound is classified as a timeout.
+type distributedOperationError struct {
+	msg  string
+	errs []error
+}
+
+func (e *distributedOperationError) Error() string   { return e.msg }
+func (e *distributedOperationError) Unwrap() []error { return e.errs }
 
 type RemoteResult struct {
 	Host  string
 	Error error
 }
 
-func distributedOperation(masterNode string, store *storage.Store, volumeId needle.VolumeId, op func(location operation.Location) error) error {
-	if lookupResult, lookupErr := operation.Lookup(masterNode, volumeId.String()); lookupErr == nil {
-		length := 0
-		selfUrl := (store.Ip + ":" + strconv.Itoa(store.Port))
-		results := make(chan RemoteResult)
-		for _, location := range lookupResult.Locations {
-			if location.Url != selfUrl {
-				length++
-				go func(location operation.Location, results chan RemoteResult) {
-					results <- RemoteResult{location.Url, op(location)}
-				}(location, results)
-			}
-		}
-		ret := DistributedOperationResult(make(map[string]error))
-		for i := 0; i < length; i++ {
-			result := <-results
-			ret[result.Host] = result.Error
-		}
-		if volume := store.GetVolume(volumeId); volume != nil {
-			if length+1 < volume.ReplicaPlacement.GetCopyCount() {
-				return fmt.Errorf("replicating opetations [%d] is less than volume's replication copy count [%d]", length+1, volume.ReplicaPlacement.GetCopyCount())
-			}
-		}
-		return ret.Error()
-	} else {
-		glog.V(0).Infoln()
-		return fmt.Errorf("Failed to lookup for %d: %v", volumeId, lookupErr)
+func DistributedOperation(ctx context.Context, locations []operation.Location, op func(ctx context.Context, location operation.Location) error) error {
+	length := len(locations)
+	if length == 0 {
+		return nil
 	}
+
+	// cancel outstanding replica ops once the outcome is decided
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// buffered so a straggler (e.g. a replica stalled on a TCP dial timeout) can
+	// still deliver its result and exit after we have already returned.
+	resultCh := make(chan RemoteResult, length)
+	for _, location := range locations {
+		go func(location operation.Location) {
+			resultCh <- RemoteResult{location.Url, op(ctx, location)}
+		}(location)
+	}
+
+	ret := DistributedOperationResult(make(map[string]error))
+	for i := 0; i < length; i++ {
+		result := <-resultCh
+		ret[result.Host] = result.Error
+		if result.Error != nil {
+			// fail fast on the first error instead of waiting for slow replicas
+			return ret.Error()
+		}
+	}
+	return ret.Error()
+}
+
+func GetRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOption, volumeId needle.VolumeId, masterFn operation.GetMasterFn) ([]operation.Location, error) {
+	return getRemoteReplications(s, grpcDialOption, volumeId, masterFn, false)
+}
+
+func GetWritableRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOption, volumeId needle.VolumeId, masterFn operation.GetMasterFn) ([]operation.Location, error) {
+	return getRemoteReplications(s, grpcDialOption, volumeId, masterFn, true)
+}
+
+func getRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOption, volumeId needle.VolumeId, masterFn operation.GetMasterFn, writableOnly bool) (remoteLocations []operation.Location, err error) {
+
+	v := s.GetVolume(volumeId)
+	if v != nil && v.ReplicaPlacement.GetCopyCount() == 1 {
+		return
+	}
+
+	// not on local store, or has replications
+	lookupResults, lookupErr := operation.LookupVolumeIds(masterFn, grpcDialOption, []string{volumeId.String()}, false)
+	lookupResult := lookupResults[volumeId.String()]
+	writableLocations := 0
+	if lookupErr == nil {
+		if lookupResult == nil {
+			err = fmt.Errorf("replicating lookup returned no result for %d", volumeId)
+			return
+		}
+		selfUrl := util.JoinHostPort(s.Ip, s.Port)
+		for _, location := range lookupResult.Locations {
+			if writableOnly && location.ReadOnly {
+				continue
+			}
+			if !writableOnly && location.ReadOnly && !location.ReadOnlyCanDelete {
+				continue
+			}
+			writableLocations++
+			if location.Url != selfUrl {
+				remoteLocations = append(remoteLocations, location)
+			}
+		}
+	} else {
+		err = fmt.Errorf("replicating lookup failed for %d: %v", volumeId, lookupErr)
+		return
+	}
+
+	if v != nil {
+		// has one local and has remote replications
+		copyCount := v.ReplicaPlacement.GetCopyCount()
+		if writableLocations < copyCount {
+			operation.InvalidateVolumeIdLocationCache(volumeId.String())
+			label := "replication"
+			if writableOnly {
+				label = "writable replication"
+			}
+			err = fmt.Errorf("%s locations [%d] is less than volume %d replication copy count [%d]",
+				label, writableLocations, volumeId, copyCount)
+		}
+	}
+
+	return
+}
+
+// classifyReplicationError maps a Go error to a bounded-cardinality failure
+// reason label for the replication_failures_total metric. Returns an empty
+// string for nil errors.
+func classifyReplicationError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return stats.FailureTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return stats.FailureContextCancelled
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, "connection refused") {
+		return stats.FailureConnectionRefused
+	}
+	return stats.FailureServerError
 }

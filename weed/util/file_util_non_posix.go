@@ -1,4 +1,4 @@
-// +build linux darwin freebsd netbsd openbsd plan9 solaris zos
+//go:build linux || darwin || freebsd || netbsd || openbsd || plan9 || solaris || zos
 
 package util
 

@@ -1,11 +1,12 @@
 package needle
 
 import (
+	"fmt"
 	"strconv"
 )
 
 const (
-	//stored unit types
+	// stored unit types
 	Empty byte = iota
 	Minute
 	Hour
@@ -43,20 +44,83 @@ func ReadTTL(ttlString string) (*TTL, error) {
 	}
 	count, err := strconv.Atoi(string(countBytes))
 	unit := toStoredByte(unitByte)
-	return &TTL{Count: byte(count), Unit: unit}, err
+	return fitTtlCount(count, unit), err
+}
+
+func fitTtlCount(count int, unit byte) *TTL {
+	seconds := ToSeconds(count, unit)
+	if seconds == 0 {
+		return EMPTY_TTL
+	}
+	if seconds%(3600*24*365) == 0 && seconds/(3600*24*365) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24 * 365)), Unit: Year}
+	}
+	if seconds%(3600*24*30) == 0 && seconds/(3600*24*30) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24 * 30)), Unit: Month}
+	}
+	if seconds%(3600*24*7) == 0 && seconds/(3600*24*7) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24 * 7)), Unit: Week}
+	}
+	if seconds%(3600*24) == 0 && seconds/(3600*24) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24)), Unit: Day}
+	}
+	if seconds%(3600) == 0 && seconds/(3600) < 256 {
+		return &TTL{Count: byte(seconds / (3600)), Unit: Hour}
+	}
+	if seconds/60 < 256 {
+		return &TTL{Count: byte(seconds / 60), Unit: Minute}
+	}
+	if seconds/(3600) < 256 {
+		return &TTL{Count: byte(seconds / (3600)), Unit: Hour}
+	}
+	if seconds/(3600*24) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24)), Unit: Day}
+	}
+	if seconds/(3600*24*7) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24 * 7)), Unit: Week}
+	}
+	if seconds/(3600*24*30) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24 * 30)), Unit: Month}
+	}
+	if seconds/(3600*24*365) < 256 {
+		return &TTL{Count: byte(seconds / (3600 * 24 * 365)), Unit: Year}
+	}
+	return EMPTY_TTL
+}
+
+// storedTTLs interns every count paired with a defined unit. The master decodes
+// one per volume in every heartbeat and keeps it for the volume's lifetime, so
+// sharing spares a cluster with millions of volume replicas a distinct two-byte
+// object for each.
+//
+// Entries are immutable. Callers must not write through the returned pointer.
+var storedTTLs = func() (table [256][Year + 1]TTL) {
+	for count := range table {
+		for unit := range table[count] {
+			table[count][unit] = TTL{Count: byte(count), Unit: byte(unit)}
+		}
+	}
+	return table
+}()
+
+func loadTTL(count, unit byte) *TTL {
+	if count == 0 && unit == 0 {
+		return EMPTY_TTL
+	}
+	if unit <= Year {
+		return &storedTTLs[count][unit]
+	}
+	return &TTL{Count: count, Unit: unit}
 }
 
 // read stored bytes to a ttl
 func LoadTTLFromBytes(input []byte) (t *TTL) {
-	return &TTL{Count: input[0], Unit: input[1]}
+	return loadTTL(input[0], input[1])
 }
 
 // read stored bytes to a ttl
 func LoadTTLFromUint32(ttl uint32) (t *TTL) {
-	input := make([]byte, 2)
-	input[1] = byte(ttl)
-	input[0] = byte(ttl >> 8)
-	return LoadTTLFromBytes(input)
+	return loadTTL(byte(ttl>>8), byte(ttl))
 }
 
 // save stored bytes to an output with 2 bytes
@@ -66,6 +130,9 @@ func (t *TTL) ToBytes(output []byte) {
 }
 
 func (t *TTL) ToUint32() (output uint32) {
+	if t == nil || t.Count == 0 {
+		return 0
+	}
 	output = uint32(t.Count) << 8
 	output += uint32(t.Unit)
 	return output
@@ -94,6 +161,30 @@ func (t *TTL) String() string {
 		return countString + "y"
 	}
 	return ""
+}
+
+func (t *TTL) ToSeconds() uint64 {
+	return ToSeconds(int(t.Count), t.Unit)
+}
+
+func ToSeconds(count int, unit byte) uint64 {
+	switch unit {
+	case Empty:
+		return 0
+	case Minute:
+		return uint64(count) * 60
+	case Hour:
+		return uint64(count) * 60 * 60
+	case Day:
+		return uint64(count) * 60 * 24 * 60
+	case Week:
+		return uint64(count) * 60 * 24 * 7 * 60
+	case Month:
+		return uint64(count) * 60 * 24 * 30 * 60
+	case Year:
+		return uint64(count) * 60 * 24 * 365 * 60
+	}
+	return 0
 }
 
 func toStoredByte(readableUnitByte byte) byte {
@@ -127,9 +218,49 @@ func (t TTL) Minutes() uint32 {
 	case Week:
 		return uint32(t.Count) * 60 * 24 * 7
 	case Month:
-		return uint32(t.Count) * 60 * 24 * 31
+		return uint32(t.Count) * 60 * 24 * 30
 	case Year:
 		return uint32(t.Count) * 60 * 24 * 365
 	}
 	return 0
+}
+
+func SecondsToTTL(seconds int32) string {
+	if seconds == 0 {
+		return ""
+	}
+	if seconds%(3600*24*365) == 0 && seconds/(3600*24*365) < 256 {
+		return fmt.Sprintf("%dy", seconds/(3600*24*365))
+	}
+	if seconds%(3600*24*30) == 0 && seconds/(3600*24*30) < 256 {
+		return fmt.Sprintf("%dM", seconds/(3600*24*30))
+	}
+	if seconds%(3600*24*7) == 0 && seconds/(3600*24*7) < 256 {
+		return fmt.Sprintf("%dw", seconds/(3600*24*7))
+	}
+	if seconds%(3600*24) == 0 && seconds/(3600*24) < 256 {
+		return fmt.Sprintf("%dd", seconds/(3600*24))
+	}
+	if seconds%(3600) == 0 && seconds/(3600) < 256 {
+		return fmt.Sprintf("%dh", seconds/(3600))
+	}
+	if seconds/60 < 256 {
+		return fmt.Sprintf("%dm", seconds/60)
+	}
+	if seconds/(3600) < 256 {
+		return fmt.Sprintf("%dh", seconds/(3600))
+	}
+	if seconds/(3600*24) < 256 {
+		return fmt.Sprintf("%dd", seconds/(3600*24))
+	}
+	if seconds/(3600*24*7) < 256 {
+		return fmt.Sprintf("%dw", seconds/(3600*24*7))
+	}
+	if seconds/(3600*24*30) < 256 {
+		return fmt.Sprintf("%dM", seconds/(3600*24*30))
+	}
+	if seconds/(3600*24*365) < 256 {
+		return fmt.Sprintf("%dy", seconds/(3600*24*365))
+	}
+	return ""
 }

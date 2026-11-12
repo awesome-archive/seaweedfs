@@ -1,122 +1,794 @@
 package filersink
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"google.golang.org/grpc"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/schollz/progressbar/v3"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/replication/source"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_pb.FileChunk) (replicatedChunks []*filer_pb.FileChunk, err error) {
+// sourceRecoveryGrace allows missing volume locations and ambiguous/proxied
+// 404s to recover from a volume server restart or master failover before the
+// chunk counts as permanently missing.
+var sourceRecoveryGrace = 30 * time.Minute
+
+// confirmedChunkMissingGrace bounds retries when every located volume replica
+// answers 404. Allow brief read/write races without stalling each vacuumed
+// needle for the volume recovery window. Keep the longer grace for missing
+// volume locations and ambiguous/proxied 404s.
+var confirmedChunkMissingGrace = 30 * time.Second
+
+// sourceLookupTimeout bounds a best-effort source entry probe: a source that
+// accepts the call but whose metadata store never answers must stall
+// replication only this long, not forever. A variable so tests can shorten it.
+var sourceLookupTimeout = 30 * time.Second
+
+// sourceEntry returns the source's live entry at sourcePath within
+// sourceLookupTimeout.
+func (fs *FilerSink) sourceEntry(sourcePath util.FullPath) (*filer_pb.Entry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sourceLookupTimeout)
+	defer cancel()
+	entry, _, _, err := filer_pb.GetEntry(ctx, fs.filerSource, sourcePath)
+	return entry, err
+}
+
+// errSourceChunkMissing is a permanent replication failure: the source cluster
+// no longer holds the chunk's data, so no later attempt can fetch it.
+var errSourceChunkMissing = errors.New("source chunk missing")
+
+// isSourceChunkMissing reports whether the source answered that it does not have
+// the chunk — no location for its volume, or a 404 from the volume server that
+// does. Both shapes also cover a volume that is merely offline, which is why the
+// gate below waits them out instead of trusting a single answer.
+func isSourceChunkMissing(err error) bool {
+	return errors.Is(err, source.ErrVolumeNotFound) || errors.Is(err, source.ErrChunkNotFound) || errors.Is(err, util_http.ErrNotFound)
+}
+
+// missingSourceChunkGate decides when to stop retrying a chunk the source cannot
+// produce, so a lookup race or a restarting volume server is waited out while a
+// vacuumed one is written off instead of retried forever. A volume that is gone
+// took every file it held with it, so its wait is kept per volume on the sink;
+// a 404 is one needle's answer, so its wait is kept per file id instead — a
+// sibling needle succeeding must not restart it, and a different needle must get
+// its own full wait.
+type missingSourceChunkGate struct {
+	sink     *FilerSink
+	volumeId string
+	fileId   string
+	gaveUp   bool
+}
+
+func (g *missingSourceChunkGate) isPermanent(err error) bool {
+	var since time.Time
+	switch {
+	case errors.Is(err, source.ErrVolumeNotFound):
+		since = g.sink.sourceVolumeMissingSince(g.volumeId)
+	case errors.Is(err, source.ErrChunkNotFound), errors.Is(err, util_http.ErrNotFound):
+		since = g.sink.sourceNeedleMissingSince(g.fileId)
+	default:
+		return false
+	}
+	if time.Since(since) < g.gracePeriod(err) {
+		return false
+	}
+	g.gaveUp = true
+	return true
+}
+
+func (g *missingSourceChunkGate) gracePeriod(err error) time.Duration {
+	if errors.Is(err, source.ErrChunkNotFound) {
+		return confirmedChunkMissingGrace
+	}
+	return sourceRecoveryGrace
+}
+
+// wrap marks err permanent once the gate gave up, so the sink can tell a source
+// that lost the data from one that is only unreachable right now.
+func (g *missingSourceChunkGate) wrap(err error) error {
+	if err == nil || !g.gaveUp {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errSourceChunkMissing, err)
+}
+
+// topLevelId anchors nested chunks to the entry-level chunk that contains them:
+// supersession is judged by whether the live entry still lists that chunk, since
+// a manifest's id is the identity of its contents.
+func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (replicatedChunks []*filer_pb.FileChunk, err error) {
 	if len(sourceChunks) == 0 {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// a simple progress bar. Not ideal. Fix me.
+	var bar *progressbar.ProgressBar
+	if len(sourceChunks) > 1 {
+		name := filepath.Base(path)
+		bar = progressbar.NewOptions64(int64(len(sourceChunks)),
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionOnCompletion(func() {
+				fmt.Fprint(os.Stderr, "\n")
+			}),
+			progressbar.OptionFullWidth(),
+			progressbar.OptionSetDescription(name),
+		)
+	}
+
+	replicatedChunks = make([]*filer_pb.FileChunk, len(sourceChunks))
+	var errLock sync.Mutex
+	setError := func(e error) {
+		if e == nil {
+			return
+		}
+		errLock.Lock()
+		if err == nil {
+			err = e
+		}
+		errLock.Unlock()
+	}
+	hasError := func() bool {
+		errLock.Lock()
+		defer errLock.Unlock()
+		return err != nil
+	}
+
 	var wg sync.WaitGroup
-	for _, sourceChunk := range sourceChunks {
-		wg.Add(1)
-		go func(chunk *filer_pb.FileChunk) {
-			defer wg.Done()
-			replicatedChunk, e := fs.replicateOneChunk(ctx, chunk)
-			if e != nil {
-				err = e
+	for chunkIndex, sourceChunk := range sourceChunks {
+		if hasError() {
+			break
+		}
+
+		if sourceChunk.IsChunkManifest {
+			anchor := topLevelId
+			if anchor == "" {
+				anchor = sourceChunk.GetFileIdString()
 			}
-			replicatedChunks = append(replicatedChunks, replicatedChunk)
-		}(sourceChunk)
+			replicatedChunk, replicateErr := fs.replicateOneManifestChunk(ctx, sourceChunk, path, replayed, anchor)
+			if replicateErr != nil {
+				setError(replicateErr)
+				break
+			}
+			replicatedChunks[chunkIndex] = replicatedChunk
+			if bar != nil {
+				bar.Add(1)
+			}
+			continue
+		}
+
+		wg.Add(1)
+		index, source := chunkIndex, sourceChunk
+		fs.executor.Execute(func() {
+			defer wg.Done()
+			var replicatedChunk *filer_pb.FileChunk
+			retryErr := util.Retry("replicate chunks", func() error {
+				chunk, e := fs.replicateOneChunk(source, path, replayed, topLevelId)
+				if e != nil {
+					return e
+				}
+				replicatedChunk = chunk
+				return nil
+			})
+			if retryErr != nil {
+				setError(retryErr)
+				return
+			}
+
+			replicatedChunks[index] = replicatedChunk
+			if bar != nil {
+				bar.Add(1)
+			}
+		})
 	}
 	wg.Wait()
 
 	return
 }
 
-func (fs *FilerSink) replicateOneChunk(ctx context.Context, sourceChunk *filer_pb.FileChunk) (*filer_pb.FileChunk, error) {
+func (fs *FilerSink) replicateOneChunk(sourceChunk *filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (*filer_pb.FileChunk, error) {
 
-	fileId, err := fs.fetchAndWrite(ctx, sourceChunk)
+	fileId, err := fs.fetchAndWrite(sourceChunk, path, replayed, topLevelId)
 	if err != nil {
-		return nil, fmt.Errorf("copy %s: %v", sourceChunk.FileId, err)
+		return nil, fmt.Errorf("copy %s: %w", sourceChunk.GetFileIdString(), err)
 	}
 
 	return &filer_pb.FileChunk{
 		FileId:       fileId,
 		Offset:       sourceChunk.Offset,
 		Size:         sourceChunk.Size,
-		Mtime:        sourceChunk.Mtime,
+		ModifiedTsNs: sourceChunk.ModifiedTsNs,
 		ETag:         sourceChunk.ETag,
-		SourceFileId: sourceChunk.FileId,
+		SourceFileId: sourceChunk.GetFileIdString(),
+		CipherKey:    sourceChunk.CipherKey,
+		IsCompressed: sourceChunk.IsCompressed,
+		SseType:      sourceChunk.SseType,
+		SseMetadata:  sourceChunk.SseMetadata,
 	}, nil
 }
 
-func (fs *FilerSink) fetchAndWrite(ctx context.Context, sourceChunk *filer_pb.FileChunk) (fileId string, err error) {
-
-	filename, header, readCloser, err := fs.filerSource.ReadPart(ctx, sourceChunk.FileId)
+func (fs *FilerSink) replicateOneManifestChunk(ctx context.Context, sourceChunk *filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (*filer_pb.FileChunk, error) {
+	// LookupFileId can transiently fail during a write burst (volume not yet
+	// registered). Retry like the data-chunk path does; the gate stops on
+	// supersession or, when that cannot be checked, after a few attempts.
+	var resolvedChunks []*filer_pb.FileChunk
+	resolveName := fmt.Sprintf("resolve manifest %s", sourceChunk.GetFileIdString())
+	missingGate := fs.newMissingSourceChunkGate(sourceChunk.GetFileIdString())
+	err := util.RetryUntil(resolveName, func() error {
+		rc, e := filer.ResolveOneChunkManifestWithFilerJwt(ctx, fs.filerSource.LookupFileId, fs.filerSource.FilerJwt(), sourceChunk, nil)
+		if e != nil {
+			return e
+		}
+		resolvedChunks = rc
+		return nil
+	}, fs.manifestResolveRetryGate(path, replayed, topLevelId, missingGate))
 	if err != nil {
-		return "", fmt.Errorf("read part %s: %v", sourceChunk.FileId, err)
+		return nil, fmt.Errorf("resolve manifest %s: %w", sourceChunk.GetFileIdString(), missingGate.wrap(err))
 	}
-	defer readCloser.Close()
 
-	var host string
-	var auth security.EncodedJwt
+	replicatedResolvedChunks, err := fs.replicateChunks(ctx, resolvedChunks, path, replayed, topLevelId)
+	if err != nil {
+		return nil, fmt.Errorf("replicate manifest data chunks %s: %w", sourceChunk.GetFileIdString(), err)
+	}
 
-	if err := fs.withFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
+	manifestDataChunks := make([]*filer_pb.FileChunk, len(replicatedResolvedChunks))
+	for i, chunk := range replicatedResolvedChunks {
+		manifestDataChunks[i] = proto.Clone(chunk).(*filer_pb.FileChunk)
+	}
+	filer_pb.BeforeEntrySerialization(manifestDataChunks)
+	manifestData, err := proto.Marshal(&filer_pb.FileChunkManifest{
+		Chunks: manifestDataChunks,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal manifest %s: %w", sourceChunk.GetFileIdString(), err)
+	}
 
-		request := &filer_pb.AssignVolumeRequest{
-			Count:       1,
-			Replication: fs.replication,
-			Collection:  fs.collection,
-			TtlSec:      fs.ttlSec,
-			DataCenter:  fs.dataCenter,
+	manifestFileId, err := fs.uploadManifestChunk(path, replayed, sourceChunk.GetFileIdString(), manifestData)
+	if err != nil {
+		return nil, err
+	}
+
+	return &filer_pb.FileChunk{
+		FileId:          manifestFileId,
+		Offset:          sourceChunk.Offset,
+		Size:            sourceChunk.Size,
+		ModifiedTsNs:    sourceChunk.ModifiedTsNs,
+		ETag:            sourceChunk.ETag,
+		SourceFileId:    sourceChunk.GetFileIdString(),
+		IsChunkManifest: true,
+	}, nil
+}
+
+// maxUnverifiableResolveAttempts bounds manifest-resolve retries when
+// supersession cannot be checked for the target path.
+const maxUnverifiableResolveAttempts = 3
+
+// manifestResolveRetryGate decides whether a failing manifest resolve keeps
+// retrying: stop when the source superseded the replayed version (the caller
+// skips it as lossless), stop once the source has been unable to produce the
+// manifest for the whole grace period, stop immediately on non-transient errors
+// (e.g. corrupt manifest data) so the configured metadata error policy applies,
+// and stop after a few attempts when supersession cannot be checked at all (incremental
+// dated target keys don't map back to a source path) — propagating lets
+// filer.backup decide with the event's real source key instead of spinning
+// here forever.
+func (fs *FilerSink) manifestResolveRetryGate(path string, replayed *filer_pb.Entry, chunkName string, missingGate *missingSourceChunkGate) func(error) bool {
+	_, canCheckSupersession := fs.targetPathToSourcePath(path)
+	attempts := 0
+	return func(resolveErr error) (shouldContinue bool) {
+		if fs.sourceMovedOn(path, replayed) {
+			glog.V(1).Infof("skip retrying stale source manifest %s for %s: %v", chunkName, path, resolveErr)
+			return false
+		}
+		if missingGate.isPermanent(resolveErr) {
+			glog.Errorf("source has not had manifest %s for %s in %v, giving up on it: %v",
+				chunkName, path, missingGate.gracePeriod(resolveErr), resolveErr)
+			return false
+		}
+		if isSourceChunkMissing(resolveErr) && fs.sourceDroppedChunk(path, chunkName, replayed) {
+			glog.V(0).Infof("source no longer lists manifest %s for %s, skipping the obsolete version: %v",
+				chunkName, path, resolveErr)
+			return false
+		}
+		if !isTransientResolveError(resolveErr) {
+			glog.V(0).Infof("resolve manifest %s for %s: non-transient error, propagating: %v", chunkName, path, resolveErr)
+			return false
+		}
+		attempts++
+		if !canCheckSupersession && attempts >= maxUnverifiableResolveAttempts {
+			glog.V(0).Infof("resolve manifest %s for %s: supersession unverifiable, propagating after %d attempts: %v", chunkName, path, attempts, resolveErr)
+			return false
+		}
+		glog.V(0).Infof("resolve manifest %s for %s: %v", chunkName, path, resolveErr)
+		return true
+	}
+}
+
+// isTransientResolveError reports whether a manifest resolve failure belongs to
+// the classes that clear on their own during a write burst — volume-lookup
+// races and network interruptions. Anything else (corrupt manifest data, bad
+// file ids) is permanent and must propagate rather than retry forever.
+func isTransientResolveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isRetryableNetworkError(err) {
+		return true
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "LookupFileId") ||
+		(strings.Contains(errStr, "volume id") && strings.Contains(errStr, "not found"))
+}
+
+func (fs *FilerSink) uploadManifestChunk(path string, replayed *filer_pb.Entry, sourceFileId string, manifestData []byte) (fileId string, err error) {
+	uploader, err := fs.getUploader()
+	if err != nil {
+		glog.V(0).Infof("upload manifest data %v: %v", sourceFileId, err)
+		return "", fmt.Errorf("upload manifest data: %w", err)
+	}
+
+	retryName := fmt.Sprintf("replicate manifest chunk %s", sourceFileId)
+	err = util.RetryUntil(retryName, func() error {
+		uploadOption := &operation.UploadOption{
+			Filename:          "",
+			Cipher:            false,
+			IsInputCompressed: false,
+			MimeType:          "application/octet-stream",
+			PairMap:           nil,
+			RetryForever:      false,
+		}
+		if fs.writeChunkByFiler {
+			uploadOption.GenUploadUrl = operation.GenUploadUrlProxy(fs.address)
+			uploadOption.FilerJwt = fs.jwtForFiler
+		}
+		currentFileId, uploadResult, uploadErr, _ := uploader.UploadWithRetry(
+			fs,
+			&filer_pb.AssignVolumeRequest{
+				Count:       1,
+				Replication: fs.replication,
+				Collection:  fs.collection,
+				TtlSec:      fs.ttlSec,
+				DataCenter:  fs.dataCenter,
+				DiskType:    fs.diskType,
+				Path:        path,
+			},
+			uploadOption,
+			bytes.NewReader(manifestData),
+		)
+		if uploadErr != nil {
+			return fmt.Errorf("upload manifest data: %w", uploadErr)
+		}
+		if uploadResult.Error != "" {
+			return fmt.Errorf("upload manifest result: %v", uploadResult.Error)
 		}
 
-		resp, err := client.AssignVolume(ctx, request)
-		if err != nil {
-			glog.V(0).Infof("assign volume failure %v: %v", request, err)
+		fileId = currentFileId
+		return nil
+	}, func(uploadErr error) (shouldContinue bool) {
+		if fs.sourceMovedOn(path, replayed) {
+			glog.V(1).Infof("skip retrying stale source manifest %s for %s: %v", sourceFileId, path, uploadErr)
+			return false
+		}
+		glog.V(0).Infof("replicate manifest %s for %s: %v", sourceFileId, path, uploadErr)
+		return true
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return fileId, nil
+}
+
+func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (fileId string, err error) {
+	uploader, err := fs.getUploader()
+	if err != nil {
+		glog.V(0).Infof("upload source data %v: %v", sourceChunk.GetFileIdString(), err)
+		return "", fmt.Errorf("upload data: %w", err)
+	}
+
+	transferStatus := &ChunkTransferStatus{
+		ChunkTransferSnapshot: ChunkTransferSnapshot{
+			ChunkFileId: sourceChunk.GetFileIdString(),
+			Path:        path,
+			Status:      "downloading",
+		},
+	}
+	fs.activeTransfers.Store(sourceChunk.GetFileIdString(), transferStatus)
+	defer fs.activeTransfers.Delete(sourceChunk.GetFileIdString())
+
+	transientBackoff := time.Duration(0)
+	_, canCheckSupersession := fs.targetPathToSourcePath(path)
+	missingGate := fs.newMissingSourceChunkGate(sourceChunk.GetFileIdString())
+	var partialData []byte
+	var savedFilename string
+	var savedHeader http.Header
+	var savedSourceUrl string
+	retryName := fmt.Sprintf("replicate chunk %s", sourceChunk.GetFileIdString())
+	err = util.RetryUntil(retryName, func() error {
+		filename, header, resp, readErr := fs.filerSource.ReadPart(sourceChunk.GetFileIdString(), int64(len(partialData)))
+		if readErr != nil {
+			return fmt.Errorf("read part %s: %w", sourceChunk.GetFileIdString(), readErr)
+		}
+		defer util_http.CloseResponse(resp)
+
+		// Save metadata from first successful response
+		if len(partialData) == 0 {
+			savedFilename = filename
+			savedHeader = header
+			if resp.Request != nil && resp.Request.URL != nil {
+				savedSourceUrl = resp.Request.URL.String()
+			}
+		}
+
+		// Read the response body
+		data, readBodyErr := io.ReadAll(resp.Body)
+		if readBodyErr != nil {
+			// Keep whatever bytes we received before the error
+			partialData = append(partialData, data...)
+			return fmt.Errorf("read body: %w", readBodyErr)
+		}
+
+		// Combine with previously accumulated partial data
+		var fullData []byte
+		if len(partialData) > 0 {
+			fullData = append(partialData, data...)
+			glog.V(0).Infof("resumed reading %s, got %d + %d = %d bytes",
+				sourceChunk.GetFileIdString(), len(partialData), len(data), len(fullData))
+			partialData = nil
+		} else {
+			fullData = data
+		}
+
+		if err := validateReplicatedReadSize(sourceChunk, len(fullData)); err != nil {
 			return err
 		}
+		fs.sourceServed(sourceChunk.GetFileIdString())
 
-		fileId, host, auth = resp.FileId, resp.Url, security.EncodedJwt(resp.Auth)
+		transferStatus.mu.Lock()
+		transferStatus.BytesReceived = int64(len(fullData))
+		transferStatus.Status = "uploading"
+		transferStatus.mu.Unlock()
 
+		uploadOption := &operation.UploadOption{
+			Filename:          savedFilename,
+			Cipher:            false,
+			IsInputCompressed: "gzip" == savedHeader.Get("Content-Encoding"),
+			MimeType:          savedHeader.Get("Content-Type"),
+			PairMap:           nil,
+			RetryForever:      false,
+			SourceUrl:         savedSourceUrl,
+		}
+		if fs.writeChunkByFiler {
+			uploadOption.GenUploadUrl = operation.GenUploadUrlProxy(fs.address)
+			uploadOption.FilerJwt = fs.jwtForFiler
+		}
+		currentFileId, uploadResult, uploadErr, _ := uploader.UploadWithRetry(
+			fs,
+			&filer_pb.AssignVolumeRequest{
+				Count:       1,
+				Replication: fs.replication,
+				Collection:  fs.collection,
+				TtlSec:      fs.ttlSec,
+				DataCenter:  fs.dataCenter,
+				DiskType:    fs.diskType,
+				Path:        path,
+			},
+			uploadOption,
+			util.NewBytesReader(fullData),
+		)
+		if uploadErr != nil {
+			return fmt.Errorf("upload data: %w", uploadErr)
+		}
+		if uploadResult.Error != "" {
+			return fmt.Errorf("upload result: %v", uploadResult.Error)
+		}
+
+		transientBackoff = 0
+		fileId = currentFileId
 		return nil
-	}); err != nil {
-		return "", fmt.Errorf("filerGrpcAddress assign volume: %v", err)
-	}
-
-	fileUrl := fmt.Sprintf("http://%s/%s", host, fileId)
-
-	glog.V(4).Infof("replicating %s to %s header:%+v", filename, fileUrl, header)
-
-	uploadResult, err := operation.Upload(fileUrl, filename, readCloser,
-		"gzip" == header.Get("Content-Encoding"), header.Get("Content-Type"), nil, auth)
+	}, func(retryErr error) (shouldContinue bool) {
+		if errors.Is(retryErr, errChunkSizeMismatch) {
+			glog.V(0).Infof("permanent size mismatch replicating %s for %s: %v",
+				sourceChunk.GetFileIdString(), path, retryErr)
+			transferStatus.mu.Lock()
+			transferStatus.LastErr = retryErr.Error()
+			transferStatus.mu.Unlock()
+			return false
+		}
+		if fs.sourceMovedOn(path, replayed) {
+			glog.V(1).Infof("skip retrying stale source %s for %s: %v", sourceChunk.GetFileIdString(), path, retryErr)
+			return false
+		}
+		transferStatus.mu.Lock()
+		transferStatus.LastErr = retryErr.Error()
+		transferStatus.mu.Unlock()
+		if isSourceChunkMissing(retryErr) {
+			if !canCheckSupersession {
+				glog.V(0).Infof("source does not have %s for %s, supersession unverifiable, propagating: %v",
+					sourceChunk.GetFileIdString(), path, retryErr)
+				return false
+			}
+			anchorId := topLevelId
+			if anchorId == "" {
+				anchorId = sourceChunk.GetFileIdString()
+			}
+			if fs.sourceDroppedChunk(path, anchorId, replayed) {
+				glog.V(0).Infof("source no longer lists %s for %s, skipping the obsolete version: %v",
+					anchorId, path, retryErr)
+				return false
+			}
+		}
+		if missingGate.isPermanent(retryErr) {
+			glog.Errorf("source has not had %s for %s in %v, giving up on it: %v",
+				sourceChunk.GetFileIdString(), path, missingGate.gracePeriod(retryErr), retryErr)
+			return false
+		}
+		if isRetryableNetworkError(retryErr) {
+			transientBackoff = nextTransientBackoff(transientBackoff)
+			transferStatus.mu.Lock()
+			transferStatus.BytesReceived = int64(len(partialData))
+			transferStatus.Status = fmt.Sprintf("waiting %v", transientBackoff)
+			transferStatus.mu.Unlock()
+			glog.V(0).Infof("connection interrupted while replicating %s for %s (%d bytes received so far), backing off %v: %v",
+				sourceChunk.GetFileIdString(), path, len(partialData), transientBackoff, retryErr)
+			time.Sleep(transientBackoff)
+			transferStatus.mu.Lock()
+			transferStatus.Status = "downloading"
+			transferStatus.mu.Unlock()
+		} else {
+			glog.V(0).Infof("replicate %s for %s: %v", sourceChunk.GetFileIdString(), path, retryErr)
+		}
+		return true
+	})
 	if err != nil {
-		glog.V(0).Infof("upload data %v to %s: %v", filename, fileUrl, err)
-		return "", fmt.Errorf("upload data: %v", err)
-	}
-	if uploadResult.Error != "" {
-		glog.V(0).Infof("upload failure %v to %s: %v", filename, fileUrl, err)
-		return "", fmt.Errorf("upload result: %v", uploadResult.Error)
+		return "", missingGate.wrap(err)
 	}
 
-	return
+	return fileId, nil
 }
 
-func (fs *FilerSink) withFilerClient(ctx context.Context, fn func(filer_pb.SeaweedFilerClient) error) error {
+const maxTransientBackoff = 2 * time.Minute
 
-	return util.WithCachedGrpcClient(ctx, func(grpcConnection *grpc.ClientConn) error {
+// nextTransientBackoff escalates 10s -> doubling -> 2m cap so an overloaded
+// destination can recover instead of being hammered by the RetryUntil loop.
+func nextTransientBackoff(current time.Duration) time.Duration {
+	if current < 10*time.Second {
+		return 10 * time.Second
+	}
+	current *= 2
+	if current > maxTransientBackoff {
+		current = maxTransientBackoff
+	}
+	return current
+}
+
+func isEofError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
+}
+
+// isRetryableNetworkError reports whether err is a transient network failure worth
+// a backoff-and-retry. A bare io.EOF counts here but not in util.IsTransientError:
+// mid-transfer it means the chunk read was truncated, not that a stream ended
+// cleanly.
+func isRetryableNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isEofError(err) || util.IsTransientError(err)
+}
+
+// errChunkSizeMismatch is a permanent (non-retriable) replication failure.
+var errChunkSizeMismatch = errors.New("chunk size mismatch")
+
+func validateReplicatedReadSize(sourceChunk *filer_pb.FileChunk, readSize int) error {
+	if uint64(readSize) != sourceChunk.Size {
+		return fmt.Errorf("%w: read %s got %d bytes, source metadata says %d",
+			errChunkSizeMismatch, sourceChunk.GetFileIdString(),
+			readSize, sourceChunk.Size)
+	}
+	return nil
+}
+
+func (fs *FilerSink) newMissingSourceChunkGate(fileId string) *missingSourceChunkGate {
+	return &missingSourceChunkGate{sink: fs, volumeId: filer.VolumeId(fileId), fileId: fileId}
+}
+
+// sourceVolumeMissingSince returns when the sink first found volumeId
+// unlocatable, recording now on the first sighting.
+func (fs *FilerSink) sourceVolumeMissingSince(volumeId string) time.Time {
+	since, _ := fs.missingVolumes.LoadOrStore(volumeId, time.Now())
+	return since.(time.Time)
+}
+
+// sourceNeedleMissingSince returns when fileId first came back not-found from
+// an answering volume, recording now on the first sighting.
+func (fs *FilerSink) sourceNeedleMissingSince(fileId string) time.Time {
+	since, _ := fs.missingNeedles.LoadOrStore(fileId, time.Now())
+	return since.(time.Time)
+}
+
+// sourceServed records a chunk the source did serve: the probe
+// sourceStillServesChunks re-checks, proof its volume is locatable again, and
+// proof the needle itself is back if it had been reported missing.
+func (fs *FilerSink) sourceServed(fileId string) {
+	fs.lastServedFileId.Store(&fileId)
+	fs.missingVolumes.Delete(filer.VolumeId(fileId))
+	fs.missingNeedles.Delete(fileId)
+}
+
+// sourceStillServesChunks reports whether the source cluster can still produce the
+// last chunk it served. A volume with no locations reads the same whether it was
+// vacuumed away or every replica is down, so before an entry is written off the
+// sink re-reads a file id the source did serve: if that one cannot be produced
+// either the source is in an outage, and skipping would drop live files wholesale.
+// It is a read and not a lookup because a lookup only proves the master still has
+// the topology, not that a volume server answers.
+func (fs *FilerSink) sourceStillServesChunks() bool {
+	if fs.filerSource == nil {
+		return false
+	}
+	probe := fs.lastServedFileId.Load()
+	if probe == nil {
+		return false
+	}
+	_, _, resp, err := fs.filerSource.ReadPart(*probe, 0)
+	if err != nil {
+		glog.V(0).Infof("source cannot serve %s either, so it is not only the one chunk: %v", *probe, err)
+		return false
+	}
+	util_http.CloseResponse(resp)
+	return true
+}
+
+// sourceDroppedChunk reports whether the live source entry still exists but no
+// longer references fileId — a version rewritten in place, which the mtime
+// supersession check cannot see. The live entry's mtime does not matter: a
+// client that preserves timestamps stamps a rewrite with an older mtime, and
+// the chunk it stopped referencing is just as gone. A live entry committed
+// before the replayed version lags the event and proves nothing.
+func (fs *FilerSink) sourceDroppedChunk(targetPath string, fileId string, replayed *filer_pb.Entry) bool {
+	sourcePath, ok := fs.targetPathToSourcePath(targetPath)
+	if !ok {
+		return false
+	}
+	live, err := fs.sourceEntry(sourcePath)
+	if err != nil || live == nil || committedBefore(live, replayed) {
+		return false
+	}
+	return !chunkFileIds(live.GetChunks())[fileId]
+}
+
+// chunkFileIds indexes a chunk list by file id. The id is the immutable needle
+// identity, so the sets compare chunk content exactly — manifest chunks need no
+// resolution, and no volume reads are involved.
+func chunkFileIds(chunks []*filer_pb.FileChunk) map[string]bool {
+	ids := make(map[string]bool, len(chunks))
+	for _, c := range chunks {
+		ids[c.GetFileIdString()] = true
+	}
+	return ids
+}
+
+// SourceSupersedes reports whether the live source's entry at sourcePath has
+// moved past the replayed version (mtimeNs) — deleted or strictly newer — so
+// skipping it is lossless. Exported for filer.backup's non-filer-sink decision.
+func SourceSupersedes(ctx context.Context, filerSource *source.FilerSource, sourcePath util.FullPath, mtimeNs int64) bool {
+	if filerSource == nil {
+		return false
+	}
+	sourceEntry, _, _, err := filer_pb.GetEntry(ctx, filerSource, sourcePath)
+	return sourceSupersedes(sourcePath, sourceEntry, err, mtimeNs)
+}
+
+// sourceSupersedes reports whether the replayed version (sourceMtimeNs) is stale:
+// true if the source entry is gone or strictly newer, false on a same/older version
+// or any non-"not found" lookup error (so a transient failure never skips a live
+// file). GetEntry signals missing as ErrNotFound — possibly wrapped or a plain gRPC
+// string, occasionally a nil entry — all treated as gone.
+func sourceSupersedes(sourcePath util.FullPath, sourceEntry *filer_pb.Entry, lookupErr error, sourceMtimeNs int64) bool {
+	if lookupErr != nil {
+		if errors.Is(lookupErr, filer_pb.ErrNotFound) || strings.Contains(lookupErr.Error(), filer_pb.ErrNotFound.Error()) {
+			glog.V(1).Infof("source entry %s no longer exists: %v", sourcePath, lookupErr)
+			return true
+		}
+		glog.V(1).Infof("lookup source entry %s: %v", sourcePath, lookupErr)
+		return false
+	}
+	if sourceEntry == nil {
+		glog.V(1).Infof("source entry %s no longer exists", sourcePath)
+		return true
+	}
+
+	// source still holds the entry; only a strictly-newer mtime proves staleness,
+	// and only when there is a valid replayed mtime to compare against.
+	if sourceMtimeNs <= 0 {
+		return false
+	}
+	return getEntryMtimeNs(sourceEntry) > sourceMtimeNs
+}
+
+func (fs *FilerSink) targetPathToSourcePath(targetPath string) (util.FullPath, bool) {
+	if fs.filerSource == nil {
+		return "", false
+	}
+
+	// Incremental sink keys carry a date prefix (sinkDir/YYYY-MM-DD/relPath) that
+	// can't be reversed to a source path; report unmappable rather than build a path
+	// under a nonexistent dated dir, which would read as ErrNotFound and skip a live entry.
+	if fs.isIncremental {
+		return "", false
+	}
+
+	normalizePath := func(p string) string {
+		p = strings.TrimSuffix(p, "/")
+		if p == "" {
+			return "/"
+		}
+		return p
+	}
+
+	sourceRoot := normalizePath(fs.filerSource.Dir)
+	targetRoot := normalizePath(fs.dir)
+	targetPath = normalizePath(targetPath)
+
+	var relative string
+	switch {
+	case targetRoot == "/":
+		relative = strings.TrimPrefix(targetPath, "/")
+	case targetPath == targetRoot:
+		relative = ""
+	case strings.HasPrefix(targetPath, targetRoot+"/"):
+		relative = targetPath[len(targetRoot)+1:]
+	default:
+		return "", false
+	}
+
+	if relative == "" {
+		return util.FullPath(sourceRoot), true
+	}
+	return util.FullPath(sourceRoot).Child(relative), true
+}
+
+var _ = filer_pb.FilerClient(&FilerSink{})
+
+func (fs *FilerSink) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+
+	return pb.WithGrpcClient(context.Background(), streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
-	}, fs.grpcAddress, fs.grpcDialOption)
+	}, fs.grpcAddress, false, fs.grpcDialOption)
 
 }
 
-func volumeId(fileId string) string {
-	lastCommaIndex := strings.LastIndex(fileId, ",")
-	if lastCommaIndex > 0 {
-		return fileId[:lastCommaIndex]
-	}
-	return fileId
+func (fs *FilerSink) AdjustedUrl(location *filer_pb.Location) string {
+	return location.Url
+}
+
+func (fs *FilerSink) GetDataCenter() string {
+	return fs.dataCenter
 }

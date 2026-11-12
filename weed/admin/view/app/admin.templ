@@ -1,0 +1,562 @@
+package app
+
+import (
+    "fmt"
+    "github.com/seaweedfs/seaweedfs/weed/admin/dash"
+)
+
+templ Admin(data dash.AdminData) {
+    <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+        <div>
+            <h1 class="h2">
+                <i class="bi bi-speedometer2 me-2"></i>Dashboard
+            </h1>
+            <p class="mb-0 text-muted">
+                if len(clusterHealthIssues(data)) == 0 {
+                    <i class="bi bi-circle-fill text-success health-dot me-2"></i>
+                } else {
+                    <i class="bi bi-circle-fill text-warning health-dot me-2"></i>
+                }
+                { clusterHealthSummary(data) }
+            </p>
+        </div>
+    </div>
+
+    <div id="dashboard-content">
+        <!-- Version mismatch warning: nodes reporting different binary versions
+             usually means an upgrade did not reach every server. -->
+        if data.VersionSummary.Mixed() {
+            <div class="alert alert-warning d-flex align-items-start" role="alert">
+                <i class="bi bi-exclamation-triangle-fill me-2 mt-1"></i>
+                <div>
+                    <strong>Mixed cluster versions detected.</strong>
+                    Not all servers are running the same SeaweedFS version — some servers may not have been upgraded.
+                    <ul class="mb-0 mt-1">
+                        for _, nt := range data.VersionSummary.NodeTypes {
+                            <li>{nt.Type}: {nt.Spread()}</li>
+                        }
+                    </ul>
+                </div>
+            </div>
+        }
+
+        <!-- Summary Cards — each carries an inline sparkline of recent history
+             from the admin's own snapshots (no Prometheus required). -->
+        <div class="row mb-2">
+            <div class="col-xl-2 col-md-4 mb-4">
+                <div class="card border-left-success shadow h-100 py-2">
+                    <div class="card-body">
+                        <div class="row no-gutters align-items-center">
+                            <div class="col mr-2">
+                                <div class="text-xs font-weight-bold text-success text-uppercase mb-1">
+                                    Volumes
+                                </div>
+                                <div class="h5 mb-0 font-weight-bold text-gray-800">
+                                    {fmt.Sprintf("%d", data.TotalVolumes)}
+                                </div>
+                                <div class="text-xs text-muted">
+                                    {fmt.Sprintf("%s limit", formatBytes(int64(data.VolumeSizeLimitMB)*1024*1024))}
+                                </div>
+                            </div>
+                            <div class="col-auto">
+                                <i class="bi bi-database icon-2x text-gray-300"></i>
+                            </div>
+                        </div>
+                        @templ.Raw(data.Trends.Volumes)
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-xl-2 col-md-4 mb-4">
+                <div class="card border-left-warning shadow h-100 py-2">
+                    <div class="card-body">
+                        <div class="row no-gutters align-items-center">
+                            <div class="col mr-2">
+                                <div class="text-xs font-weight-bold text-warning text-uppercase mb-1">
+                                    Disk usage
+                                </div>
+                                <div class="h5 mb-0 font-weight-bold text-gray-800">
+                                    {formatBytes(data.DiskUsage)}
+                                </div>
+                                if data.DiskCapacity > 0 {
+                                    <div class="text-xs text-muted">
+                                        of {formatBytes(data.DiskCapacity)} ({fmt.Sprintf("%d%%", calculatePercent64(data.DiskUsage, data.DiskCapacity))})
+                                    </div>
+                                }
+                            </div>
+                            <div class="col-auto">
+                                <i class="bi bi-device-hdd icon-2x text-gray-300"></i>
+                            </div>
+                        </div>
+                        @templ.Raw(data.Trends.DiskUsed)
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-xl-2 col-md-4 mb-4">
+                <div class="card border-left-info shadow h-100 py-2">
+                    <div class="card-body">
+                        <div class="row no-gutters align-items-center">
+                            <div class="col mr-2">
+                                <div class="text-xs font-weight-bold text-info text-uppercase mb-1" title="Chunks stored in volumes. A file is split into one or more chunks, so this is not the number of files.">
+                                    Chunks
+                                </div>
+                                <div class="h5 mb-0 font-weight-bold text-gray-800">
+                                    {formatNumber(data.TotalChunks)}
+                                </div>
+                            </div>
+                            <div class="col-auto">
+                                <i class="bi bi-boxes icon-2x text-gray-300"></i>
+                            </div>
+                        </div>
+                        @templ.Raw(data.Trends.Chunks)
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-xl-2 col-md-4 mb-4">
+                <div class="card border-left-secondary shadow h-100 py-2">
+                    <div class="card-body">
+                        <div class="row no-gutters align-items-center">
+                            <div class="col mr-2">
+                                <div class="text-xs font-weight-bold text-secondary text-uppercase mb-1">
+                                    EC shards
+                                </div>
+                                <div class="h5 mb-0 font-weight-bold text-gray-800">
+                                    {fmt.Sprintf("%d", data.TotalEcShards)}
+                                </div>
+                                if data.TotalEcVolumes > 0 {
+                                    <div class="text-xs text-muted">
+                                        {fmt.Sprintf("in %s", countNoun(data.TotalEcVolumes, "EC volume"))}
+                                    </div>
+                                }
+                            </div>
+                            <div class="col-auto">
+                                <i class="bi bi-puzzle icon-2x text-gray-300"></i>
+                            </div>
+                        </div>
+                        @templ.Raw(data.Trends.EcShards)
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-xl-2 col-md-4 mb-4">
+                <div class="card border-left-info shadow h-100 py-2">
+                    <div class="card-body">
+                        <div class="row no-gutters align-items-center">
+                            <div class="col mr-2">
+                                <div class="text-xs font-weight-bold text-info text-uppercase mb-1">
+                                    Active tasks
+                                </div>
+                                <div class="h5 mb-0 font-weight-bold text-gray-800">
+                                    { data.Trends.TasksValue }
+                                </div>
+                            </div>
+                            <div class="col-auto">
+                                <i class="bi bi-list-check icon-2x text-gray-300"></i>
+                            </div>
+                        </div>
+                        @templ.Raw(data.Trends.Tasks)
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-xl-2 col-md-4 mb-4">
+                <div class="card border-left-primary shadow h-100 py-2">
+                    <div class="card-body">
+                        <div class="row no-gutters align-items-center">
+                            <div class="col mr-2">
+                                <div class="text-xs font-weight-bold text-primary text-uppercase mb-1">
+                                    Workers
+                                </div>
+                                <div class="h5 mb-0 font-weight-bold text-gray-800">
+                                    { data.Trends.WorkersValue }
+                                </div>
+                            </div>
+                            <div class="col-auto">
+                                <i class="bi bi-people-fill icon-2x text-gray-300"></i>
+                            </div>
+                        </div>
+                        @templ.Raw(data.Trends.Workers)
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Storage Tiers -->
+        if len(data.TierStats) > 0 {
+            <div class="row mb-4">
+                <div class="col-12">
+                    <div class="card shadow mb-4">
+                        <div class="card-header py-3">
+                            <h6 class="m-0 font-weight-bold text-primary">
+                                <i class="bi bi-layers me-2"></i>Storage Tiers
+                            </h6>
+                        </div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-hover" width="100%" cellspacing="0">
+                                    <thead>
+                                        <tr>
+                                            <th>Tier</th>
+                                            <th>Volumes</th>
+                                            <th>EC Shards</th>
+                                            <th>Data Size</th>
+                                            <th>Disk Used</th>
+                                            <th>Capacity</th>
+                                            <th>Usage</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        for _, tier := range data.TierStats {
+                                            <tr>
+                                                <td>
+                                                    if tier.IsRemote {
+                                                        <i class="bi bi-cloud me-1 text-info"></i>{tier.Name}
+                                                        <span class="badge bg-info text-white ms-1">remote</span>
+                                                    } else {
+                                                        <i class="bi bi-device-hdd me-1 text-muted"></i>{tier.Name}
+                                                    }
+                                                </td>
+                                                <td>{fmt.Sprintf("%d", tier.VolumeCount)}</td>
+                                                <td>
+                                                    if tier.IsRemote {
+                                                        <span class="text-muted">–</span>
+                                                    } else {
+                                                        {fmt.Sprintf("%d", tier.EcShardCount)}
+                                                    }
+                                                </td>
+                                                <td>{formatBytes(tier.DataSize)}</td>
+                                                <td>
+                                                    if tier.IsRemote || tier.DiskUsed == 0 {
+                                                        <span class="text-muted">–</span>
+                                                    } else {
+                                                        {formatBytes(tier.DiskUsed)}
+                                                    }
+                                                </td>
+                                                <td>
+                                                    if tier.IsRemote {
+                                                        <span class="text-muted">–</span>
+                                                    } else {
+                                                        {formatBytes(tier.DiskCapacity)}
+                                                    }
+                                                </td>
+                                                <td>
+                                                    if tier.IsRemote {
+                                                        <span class="text-muted">–</span>
+                                                    } else {
+                                                        <div class="d-flex align-items-center">
+                                                            <div class="progress flex-grow-1" style="height: 20px; min-width: 48px;">
+                                                                <div class="progress-bar" role="progressbar"
+                                                                     style={fmt.Sprintf("width: %d%%", tier.UsagePercent())}>
+                                                                </div>
+                                                            </div>
+                                                            <span class="ms-2 text-nowrap">{fmt.Sprintf("%d%%", tier.UsagePercent())}</span>
+                                                        </div>
+                                                    }
+                                                </td>
+                                            </tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        }
+
+        <!-- Master Nodes Status -->
+        <div class="row mb-4">
+            <div class="col-lg-4">
+                <div class="card shadow mb-4">
+                    <div class="card-header py-3">
+                        <h6 class="m-0 font-weight-bold text-primary">
+                            <i class="bi bi-server me-2"></i>Master Nodes
+                        </h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-bordered" width="100%" cellspacing="0">
+                                <thead>
+                                    <tr>
+                                        <th>Address</th>
+                                        <th>Role</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    for _, master := range data.MasterNodes {
+                                        <tr>
+                                            <td>
+                                                <a href={templ.SafeURL(fmt.Sprintf("//%s/ui/index.html", master.Address))} target="_blank">
+                                                    {master.Address}
+                                                    <i class="bi bi-box-arrow-up-right ms-1 text-muted"></i>
+                                                </a>
+                                            </td>
+                                            <td>
+                                                if master.IsLeader {
+                                                    <span class="badge bg-primary">Leader</span>
+                                                } else {
+                                                    <span class="badge bg-secondary">Follower</span>
+                                                }
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- System Health -->
+            <div class="col-lg-8">
+                <div class="card shadow mb-4">
+                    <div class="card-header py-3">
+                        <h6 class="m-0 font-weight-bold text-primary">
+                            <i class="bi bi-pie-chart me-2"></i>Cluster
+                        </h6>
+                    </div>
+                    <div class="card-body text-center">
+                        <div class="row g-0">
+                            <a class="col cluster-count" href={ dash.PUrl(ctx, "/cluster/masters") }>
+                                <div class="h5 mb-0">{fmt.Sprintf("%d", len(data.MasterNodes))}</div>
+                                <small class="text-muted">Masters</small>
+                            </a>
+                            <a class="col cluster-count" href={ dash.PUrl(ctx, "/cluster/volume-servers") }>
+                                <div class="h5 mb-0">{fmt.Sprintf("%d", len(data.VolumeServers))}</div>
+                                <small class="text-muted">Volume servers</small>
+                            </a>
+                            <a class="col cluster-count" href={ dash.PUrl(ctx, "/cluster/filers") }>
+                                <div class="h5 mb-0">{fmt.Sprintf("%d", len(data.FilerNodes))}</div>
+                                <small class="text-muted">Filers</small>
+                            </a>
+                            <a class="col cluster-count" href={ dash.PUrl(ctx, "/cluster/s3") }>
+                                <div class="h5 mb-0">{fmt.Sprintf("%d", len(data.S3Nodes))}</div>
+                                <small class="text-muted">S3 servers</small>
+                            </a>
+                            <a class="col cluster-count" href={ dash.PUrl(ctx, "/cluster/mount-clients") }>
+                                <div class="h5 mb-0">{fmt.Sprintf("%d", data.TotalMountClients)}</div>
+                                <small class="text-muted">Mount clients</small>
+                            </a>
+                            <a class="col cluster-count" href={ dash.PUrl(ctx, "/mq/brokers") }>
+                                <div class="h5 mb-0">{fmt.Sprintf("%d", len(data.MessageBrokers))}</div>
+                                <small class="text-muted">Message brokers</small>
+                            </a>
+                            <div class="col cluster-count">
+                                if data.VersionSummary.Uniform {
+                                    <div class="h5 mb-0 text-truncate" title={data.VersionSummary.Version}>{data.VersionSummary.Version}</div>
+                                    <small class="text-muted">Version</small>
+                                } else if data.VersionSummary.Mixed() {
+                                    <div class="h5 mb-0 text-warning"><i class="bi bi-exclamation-triangle-fill"></i></div>
+                                    <small class="text-muted">Mixed versions</small>
+                                } else {
+                                    <div class="h5 mb-0">–</div>
+                                    <small class="text-muted">Version</small>
+                                }
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Volume Servers -->
+        <div class="row">
+            <div class="col-12">
+                <div class="card shadow mb-4">
+                    <div class="card-header py-3 d-flex flex-row align-items-center justify-content-between">
+                        <h6 class="m-0 font-weight-bold text-primary">
+                            <i class="bi bi-database me-2"></i>Volume Servers
+                        </h6>
+                        <a href={ dash.PUrl(ctx, "/cluster/volume-servers") } class="btn btn-sm btn-outline-primary">
+                            View all <i class="bi bi-arrow-right ms-1"></i>
+                        </a>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover" width="100%" cellspacing="0">
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Address</th>
+                                        <th>Data Center</th>
+                                        <th>Rack</th>
+                                        <th>Version</th>
+                                        <th>Volumes</th>
+                                        <th>EC Shards</th>
+                                        <th>Usage / Capacity</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    for _, vs := range data.VolumeServers {
+                                        <tr>
+                                            <td>{vs.ID}</td>
+                                            <td>
+                                                <a href={templ.SafeURL(fmt.Sprintf("//%s/ui/index.html", vs.GetDisplayAddress()))} target="_blank">
+                                                    {vs.GetDisplayAddress()}
+                                                    <i class="bi bi-box-arrow-up-right ms-1 text-muted"></i>
+                                                </a>
+                                            </td>
+                                            <td>{vs.DataCenter}</td>
+                                            <td>{vs.Rack}</td>
+                                            <td title={vs.Version}>{dash.ShortVersion(vs.Version)}</td>
+                                            <td>
+                                                <div class="d-flex align-items-center">
+                                                    <div class="progress flex-grow-1" style="height: 20px; min-width: 48px;">
+                                                        <div class="progress-bar" role="progressbar" 
+                                                             style={fmt.Sprintf("width: %d%%", calculatePercent(vs.Volumes, vs.MaxVolumes))}>
+                                                        </div>
+                                                    </div>
+                                                    <span class="ms-2 text-nowrap">{fmt.Sprintf("%d/%d", vs.Volumes, vs.MaxVolumes)}</span>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                if vs.EcShards > 0 {
+                                                    <span class="badge bg-info text-white me-1">{fmt.Sprintf("%d", vs.EcShards)}</span>
+                                                    if vs.EcVolumes > 0 {
+                                                        <small class="text-muted">({fmt.Sprintf("%d vol", vs.EcVolumes)})</small>
+                                                    }
+                                                } else {
+                                                    <span class="text-muted">–</span>
+                                                }
+                                            </td>
+                                            <td>
+                                                {formatBytes(vs.DiskUsage)} / {formatBytes(vs.DiskCapacity)}
+                                                if vs.RemoteSize > 0 {
+                                                    <br/>
+                                                    <small class="text-muted"><i class="bi bi-cloud me-1"></i>{formatBytes(vs.RemoteSize)} remote</small>
+                                                }
+                                            </td>
+                                        </tr>
+                                    }
+                                    if len(data.VolumeServers) == 0 {
+                                        <tr>
+                                            <td colspan="8" class="text-center text-muted py-4">
+                                                <i class="bi bi-info-circle me-2"></i>
+                                                No volume servers found
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Filer Nodes -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card shadow mb-4">
+                    <div class="card-header py-3 d-flex flex-row align-items-center justify-content-between">
+                        <h6 class="m-0 font-weight-bold text-primary">
+                            <i class="bi bi-folder me-2"></i>Filer Nodes
+                        </h6>
+                        <a href={ dash.PUrl(ctx, "/cluster/filers") } class="btn btn-sm btn-outline-primary">
+                            View all <i class="bi bi-arrow-right ms-1"></i>
+                        </a>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover" width="100%" cellspacing="0">
+                                <thead>
+                                    <tr>
+                                        <th>Address</th>
+                                        <th>Data Center</th>
+                                        <th>Rack</th>
+                                        <th>Version</th>
+                                        <th>Last Updated</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    for _, filer := range data.FilerNodes {
+                                        <tr>
+                                            <td>
+                                                <a href={templ.SafeURL(fmt.Sprintf("//%s", filer.Address))} target="_blank">
+                                                    {filer.Address}
+                                                    <i class="bi bi-box-arrow-up-right ms-1 text-muted"></i>
+                                                </a>
+                                            </td>
+                                            <td>{filer.DataCenter}</td>
+                                            <td>{filer.Rack}</td>
+                                            <td title={filer.Version}>{dash.ShortVersion(filer.Version)}</td>
+                                            <td>{filer.LastUpdated.Format("2006-01-02 15:04:05")}</td>
+                                        </tr>
+                                    }
+                                    if len(data.FilerNodes) == 0 {
+                                        <tr>
+                                            <td colspan="5" class="text-center text-muted py-4">
+                                                <i class="bi bi-info-circle me-2"></i>
+                                                No filer nodes found
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- S3 Servers -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card shadow mb-4">
+                    <div class="card-header py-3 d-flex flex-row align-items-center justify-content-between">
+                        <h6 class="m-0 font-weight-bold text-primary">
+                            <i class="bi bi-cloud me-2"></i>S3 Servers
+                        </h6>
+                        <a href={ dash.PUrl(ctx, "/cluster/s3") } class="btn btn-sm btn-outline-primary">
+                            View all <i class="bi bi-arrow-right ms-1"></i>
+                        </a>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover" width="100%" cellspacing="0">
+                                <thead>
+                                    <tr>
+                                        <th>Address</th>
+                                        <th>Data Center</th>
+                                        <th>Version</th>
+                                        <th>Last Updated</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    for _, s3Node := range data.S3Nodes {
+                                        <tr>
+                                            <td>{s3Node.Address}</td>
+                                            <td>{s3Node.DataCenter}</td>
+                                            <td title={s3Node.Version}>{dash.ShortVersion(s3Node.Version)}</td>
+                                            <td>{s3Node.LastUpdated.Format("2006-01-02 15:04:05")}</td>
+                                        </tr>
+                                    }
+                                    if len(data.S3Nodes) == 0 {
+                                        <tr>
+                                            <td colspan="4" class="text-center text-muted py-4">
+                                                <i class="bi bi-info-circle me-2"></i>
+                                                No S3 servers found
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Last Updated -->
+        <div class="row">
+            <div class="col-12">
+                <small class="text-muted">
+                    <i class="bi bi-clock me-1"></i>
+                    Last updated: {data.LastUpdated.Format("2006-01-02 15:04:05")}
+                </small>
+            </div>
+        </div>
+    </div>
+} 

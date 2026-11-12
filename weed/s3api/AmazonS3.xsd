@@ -525,6 +525,7 @@
       <xsd:element name="IsTruncated" type="xsd:boolean"/>
       <xsd:element name="Contents" type="tns:ListEntry" minOccurs="0" maxOccurs="unbounded"/>
       <xsd:element name="CommonPrefixes" type="tns:PrefixEntry" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:element name="EncodingType" type="xsd:string"/>
     </xsd:sequence>
   </xsd:complexType>
 
@@ -577,6 +578,8 @@
     <xsd:sequence>
       <xsd:element name="Owner" type="tns:CanonicalUser"/>
       <xsd:element name="Buckets" type="tns:ListAllMyBucketsList"/>
+      <xsd:element name="ContinuationToken" type="xsd:string" minOccurs="0"/>
+      <xsd:element name="Prefix" type="xsd:string" minOccurs="0"/>
     </xsd:sequence>
   </xsd:complexType>
 

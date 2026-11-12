@@ -2,240 +2,385 @@ package weed_server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"io/ioutil"
-	"mime"
+	"fmt"
 	"net/http"
-	"net/url"
 	"os"
-	filenamePath "path"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/constants"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
 	OS_UID = uint32(os.Getuid())
 	OS_GID = uint32(os.Getgid())
+
+	// ErrReadOnly is filer_pb.ErrReadOnly so errors.Is matches on either side
+	// of the gRPC boundary.
+	ErrReadOnly = filer_pb.ErrReadOnly
 )
 
 type FilerPostResult struct {
 	Name  string `json:"name,omitempty"`
-	Size  uint32 `json:"size,omitempty"`
+	Size  int64  `json:"size,omitempty"`
 	Error string `json:"error,omitempty"`
-	Fid   string `json:"fid,omitempty"`
-	Url   string `json:"url,omitempty"`
 }
 
-func (fs *FilerServer) assignNewFileInfo(w http.ResponseWriter, r *http.Request, replication, collection string, dataCenter string) (fileId, urlLocation string, auth security.EncodedJwt, err error) {
-	ar := &operation.VolumeAssignRequest{
-		Count:       1,
-		Replication: replication,
-		Collection:  collection,
-		Ttl:         r.URL.Query().Get("ttl"),
-		DataCenter:  dataCenter,
-	}
-	var altRequest *operation.VolumeAssignRequest
-	if dataCenter != "" {
-		altRequest = &operation.VolumeAssignRequest{
-			Count:       1,
-			Replication: replication,
-			Collection:  collection,
-			Ttl:         r.URL.Query().Get("ttl"),
-			DataCenter:  "",
-		}
+func (fs *FilerServer) assignNewFileInfo(ctx context.Context, so *operation.StorageOption, expectedDataSize uint64) (fileId, urlLocation string, auth security.EncodedJwt, err error) {
+
+	stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssign).Inc()
+	start := time.Now()
+	defer func() {
+		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkAssign).Observe(time.Since(start).Seconds())
+	}()
+
+	ar, altRequest := so.ToAssignRequests(1)
+	ar.ExpectedDataSize = expectedDataSize
+	if altRequest != nil {
+		altRequest.ExpectedDataSize = expectedDataSize
 	}
 
-	assignResult, ae := operation.Assign(fs.filer.GetMaster(), fs.grpcDialOption, ar, altRequest)
+	// Use a context that ignores cancellation from the request context
+	assignCtx := context.WithoutCancel(ctx)
+
+	assignResult, ae := operation.Assign(assignCtx, fs.filer.GetMaster, fs.masterGrpcDialOption(), ar, altRequest)
 	if ae != nil {
-		glog.Errorf("failing to assign a file id: %v", ae)
-		writeJsonError(w, r, http.StatusInternalServerError, ae)
+		glog.ErrorfCtx(ctx, "failing to assign a file id: %v", ae)
 		err = ae
 		return
 	}
 	fileId = assignResult.Fid
-	urlLocation = "http://" + assignResult.Url + "/" + assignResult.Fid
+	assignUrl := assignResult.Url
+	// Prefer same data center
+	if fs.option.DataCenter != "" {
+		for _, repl := range assignResult.Replicas {
+			if repl.DataCenter == fs.option.DataCenter {
+				assignUrl = repl.Url
+				break
+			}
+		}
+	}
+	urlLocation = "http://" + assignUrl + "/" + assignResult.Fid
+	if so.Fsync {
+		urlLocation += "?fsync=true"
+	}
 	auth = assignResult.Auth
 	return
 }
 
-func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request) {
+func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request, contentLength int64) {
+	ctx := r.Context()
 
-	ctx := context.Background()
+	// Match storage rules on the decoded path the entry is written to. The raw
+	// request-target is percent-encoded on the wire, so a rule on "/只读/" would
+	// never see "/%E5%8F%AA%E8%AF%BB/".
+	destination := r.URL.Path
+	headerDestination := r.Header.Get(s3_constants.SeaweedStorageDestinationHeader)
+	if headerDestination != "" {
+		destination = headerDestination
+	}
+
+	// The destination header picks storage rules for a logical destination, but
+	// the entry is written at r.URL.Path. Enforce the read-only/quota rule on the
+	// actual write path too, so the header cannot route a write into a read-only
+	// location.
+	if headerDestination != "" && fs.filer.FilerConf.MatchStorageRule(r.URL.Path).ReadOnly {
+		writeJsonError(w, r, http.StatusInsufficientStorage, ErrReadOnly)
+		return
+	}
 
 	query := r.URL.Query()
-	replication := query.Get("replication")
-	if replication == "" {
-		replication = fs.option.DefaultReplication
-	}
-	collection := query.Get("collection")
-	if collection == "" {
-		collection = fs.option.Collection
-	}
-	dataCenter := query.Get("dataCenter")
-	if dataCenter == "" {
-		dataCenter = fs.option.DataCenter
-	}
-
-	if autoChunked := fs.autoChunk(ctx, w, r, replication, collection, dataCenter); autoChunked {
-		return
-	}
-
-	fileId, urlLocation, auth, err := fs.assignNewFileInfo(w, r, replication, collection, dataCenter)
-
-	if err != nil || fileId == "" || urlLocation == "" {
-		glog.V(0).Infof("fail to allocate volume for %s, collection:%s, datacenter:%s", r.URL.Path, collection, dataCenter)
-		return
-	}
-
-	glog.V(4).Infof("write %s to %v", r.URL.Path, urlLocation)
-
-	u, _ := url.Parse(urlLocation)
-
-	// This allows a client to generate a chunk manifest and submit it to the filer -- it is a little off
-	// because they need to provide FIDs instead of file paths...
-	cm, _ := strconv.ParseBool(query.Get("cm"))
-	if cm {
-		q := u.Query()
-		q.Set("cm", "true")
-		u.RawQuery = q.Encode()
-	}
-	glog.V(4).Infoln("post to", u)
-
-	// send request to volume server
-	request := &http.Request{
-		Method:        r.Method,
-		URL:           u,
-		Proto:         r.Proto,
-		ProtoMajor:    r.ProtoMajor,
-		ProtoMinor:    r.ProtoMinor,
-		Header:        r.Header,
-		Body:          r.Body,
-		Host:          r.Host,
-		ContentLength: r.ContentLength,
-	}
-	if auth != "" {
-		request.Header.Set("Authorization", "BEARER "+string(auth))
-	}
-	resp, do_err := util.Do(request)
-	if do_err != nil {
-		glog.Errorf("failing to connect to volume server %s: %v, %+v", r.RequestURI, do_err, r.Method)
-		writeJsonError(w, r, http.StatusInternalServerError, do_err)
-		return
-	}
-	defer func() {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-	etag := resp.Header.Get("ETag")
-	resp_body, ra_err := ioutil.ReadAll(resp.Body)
-	if ra_err != nil {
-		glog.V(0).Infoln("failing to upload to volume server", r.RequestURI, ra_err.Error())
-		writeJsonError(w, r, http.StatusInternalServerError, ra_err)
-		return
-	}
-	glog.V(4).Infoln("post result", string(resp_body))
-	var ret operation.UploadResult
-	unmarshal_err := json.Unmarshal(resp_body, &ret)
-	if unmarshal_err != nil {
-		glog.V(0).Infoln("failing to read upload resonse", r.RequestURI, string(resp_body))
-		writeJsonError(w, r, http.StatusInternalServerError, unmarshal_err)
-		return
-	}
-	if ret.Error != "" {
-		glog.V(0).Infoln("failing to post to volume server", r.RequestURI, ret.Error)
-		writeJsonError(w, r, http.StatusInternalServerError, errors.New(ret.Error))
-		return
-	}
-
-	// find correct final path
-	path := r.URL.Path
-	if strings.HasSuffix(path, "/") {
-		if ret.Name != "" {
-			path += ret.Name
+	so, err := fs.detectStorageOption0(ctx, destination,
+		query.Get("collection"),
+		query.Get("replication"),
+		query.Get("ttl"),
+		query.Get("disk"),
+		query.Get("fsync"),
+		query.Get("dataCenter"),
+		query.Get("rack"),
+		query.Get("dataNode"),
+		query.Get("saveInside"),
+	)
+	if err != nil {
+		if errors.Is(err, ErrReadOnly) {
+			writeJsonError(w, r, http.StatusInsufficientStorage, err)
 		} else {
-			fs.filer.DeleteFileByFileId(fileId)
-			glog.V(0).Infoln("Can not to write to folder", path, "without a file name!")
-			writeJsonError(w, r, http.StatusInternalServerError,
-				errors.New("Can not to write to folder "+path+" without a file name"))
-			return
+			glog.V(1).InfolnCtx(ctx, "post", r.RequestURI, ":", err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-	}
-
-	// update metadata in filer store
-	existingEntry, err := fs.filer.FindEntry(ctx, filer2.FullPath(path))
-	crTime := time.Now()
-	if err == nil && existingEntry != nil {
-		// glog.V(4).Infof("existing %s => %+v", path, existingEntry)
-		if existingEntry.IsDirectory() {
-			path += "/" + ret.Name
-		} else {
-			crTime = existingEntry.Crtime
-		}
-	}
-	entry := &filer2.Entry{
-		FullPath: filer2.FullPath(path),
-		Attr: filer2.Attr{
-			Mtime:       time.Now(),
-			Crtime:      crTime,
-			Mode:        0660,
-			Uid:         OS_UID,
-			Gid:         OS_GID,
-			Replication: replication,
-			Collection:  collection,
-			TtlSec:      int32(util.ParseInt(r.URL.Query().Get("ttl"), 0)),
-		},
-		Chunks: []*filer_pb.FileChunk{{
-			FileId: fileId,
-			Size:   uint64(ret.Size),
-			Mtime:  time.Now().UnixNano(),
-			ETag:   etag,
-		}},
-	}
-	if ext := filenamePath.Ext(path); ext != "" {
-		entry.Attr.Mime = mime.TypeByExtension(ext)
-	}
-	// glog.V(4).Infof("saving %s => %+v", path, entry)
-	if db_err := fs.filer.CreateEntry(ctx, entry); db_err != nil {
-		fs.filer.DeleteChunks(entry.FullPath, entry.Chunks)
-		glog.V(0).Infof("failing to write %s to filer server : %v", path, db_err)
-		writeJsonError(w, r, http.StatusInternalServerError, db_err)
 		return
 	}
 
-	// send back post result
-	reply := FilerPostResult{
-		Name:  ret.Name,
-		Size:  ret.Size,
-		Error: ret.Error,
-		Fid:   fileId,
-		Url:   urlLocation,
+	if so.Fsync {
+		ctx = filer.WithSyncWrite(ctx)
 	}
-	setEtag(w, etag)
-	writeJsonQuiet(w, r, http.StatusCreated, reply)
+
+	if util.FullPath(r.URL.Path).IsLongerFileName(so.MaxFileNameLength) {
+		glog.V(1).InfolnCtx(ctx, "post", r.RequestURI, ": ", "entry name too long")
+		w.WriteHeader(http.StatusRequestURITooLong)
+		return
+	}
+
+	// When DiskType is empty,use filer's -disk
+	if so.DiskType == "" {
+		so.DiskType = fs.option.DiskType
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/etc") {
+		so.SaveInside = true
+	}
+
+	if query.Has("mv.from") {
+		fs.move(ctx, w, r, so)
+	} else if query.Has("cp.from") {
+		fs.copy(ctx, w, r, so)
+	} else if isExtractZip(r) {
+		fs.extractZipArchive(ctx, w, r)
+	} else {
+		fs.autoChunk(ctx, w, r, contentLength, so)
+	}
+
+	util_http.CloseRequest(r)
+
+}
+
+func (fs *FilerServer) move(ctx context.Context, w http.ResponseWriter, r *http.Request, so *operation.StorageOption) {
+	src := r.URL.Query().Get("mv.from")
+	dst := r.URL.Path
+
+	glog.V(2).InfofCtx(ctx, "FilerServer.move %v to %v", src, dst)
+
+	var err error
+	if src, err = clearName(src); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if dst, err = clearName(dst); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	src = strings.TrimRight(src, "/")
+	if src == "" {
+		err = fmt.Errorf("invalid source '/'")
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	srcPath := util.FullPath(src)
+	dstPath := util.FullPath(dst)
+	if dstPath.IsLongerFileName(so.MaxFileNameLength) {
+		err = fmt.Errorf("dst name to long")
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	srcEntry, err := fs.filer.FindEntry(ctx, srcPath)
+	if err != nil {
+		err = fmt.Errorf("failed to get src entry '%s', err: %s", src, err)
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	wormEnforced, err := fs.wormEnforcedForEntry(ctx, src)
+	if err != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	} else if wormEnforced {
+		// you cannot move a worm file or directory
+		err = fmt.Errorf("cannot move write-once entry from '%s' to '%s': %s", src, dst, constants.ErrMsgOperationNotPermitted)
+		writeJsonError(w, r, http.StatusForbidden, err)
+		return
+	}
+
+	oldDir, oldName := srcPath.DirAndName()
+	newDir, newName := dstPath.DirAndName()
+	newName = util.Nvl(newName, oldName)
+
+	dstEntry, err := fs.filer.FindEntry(ctx, util.FullPath(strings.TrimRight(dst, "/")))
+	if err != nil && err != filer_pb.ErrNotFound {
+		err = fmt.Errorf("failed to get dst entry '%s', err: %s", dst, err)
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	}
+	if err == nil && !dstEntry.IsDirectory() && srcEntry.IsDirectory() {
+		err = fmt.Errorf("move: cannot overwrite non-directory '%s' with directory '%s'", dst, src)
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	_, err = fs.AtomicRenameEntry(ctx, &filer_pb.AtomicRenameEntryRequest{
+		OldDirectory: oldDir,
+		OldName:      oldName,
+		NewDirectory: newDir,
+		NewName:      newName,
+	})
+	if err != nil {
+		err = fmt.Errorf("failed to move entry from '%s' to '%s', err: %s", src, dst, err)
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // curl -X DELETE http://localhost:8888/path/to
 // curl -X DELETE http://localhost:8888/path/to?recursive=true
+// curl -X DELETE http://localhost:8888/path/to?recursive=true&ignoreRecursiveError=true
+// curl -X DELETE http://localhost:8888/path/to?recursive=true&skipChunkDeletion=true
 func (fs *FilerServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
-
 	isRecursive := r.FormValue("recursive") == "true"
+	if !isRecursive && fs.option.recursiveDelete {
+		if r.FormValue("recursive") != "false" {
+			isRecursive = true
+		}
+	}
+	ignoreRecursiveError := r.FormValue("ignoreRecursiveError") == "true"
+	skipChunkDeletion := r.FormValue("skipChunkDeletion") == "true"
 
-	err := fs.filer.DeleteEntryMetaAndData(context.Background(), filer2.FullPath(r.URL.Path), isRecursive, true)
+	objectPath := r.URL.Path
+	if len(r.URL.Path) > 1 && strings.HasSuffix(objectPath, "/") {
+		objectPath = objectPath[0 : len(objectPath)-1]
+	}
+
+	wormEnforced, err := fs.wormEnforcedForEntry(context.TODO(), objectPath)
 	if err != nil {
-		glog.V(1).Infoln("deleting", r.URL.Path, ":", err.Error())
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	} else if wormEnforced {
+		writeJsonError(w, r, http.StatusForbidden, errors.New(constants.ErrMsgOperationNotPermitted))
+		return
+	}
+
+	// The delete and the commit record it emits must serialize with peer
+	// replay of this path, same as the gRPC DeleteEntry handler.
+	fullPath := util.FullPath(objectPath)
+	if fs.entryLockTable != nil {
+		pathLock := fs.entryLockTable.AcquireLock("DeleteHandler", fullPath, util.ExclusiveLock)
+		defer fs.entryLockTable.ReleaseLock(fullPath, pathLock)
+	}
+
+	err = fs.filer.DeleteEntryMetaAndData(context.Background(), fullPath, isRecursive, ignoreRecursiveError, !skipChunkDeletion, false, nil, time.Time{})
+	if err != nil && err != filer_pb.ErrNotFound {
+		glog.V(1).Infoln("deleting", objectPath, ":", err.Error())
 		writeJsonError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// bucketDefaultCollection returns the collection a write under the buckets
+// folder falls back to when neither the request nor a filer.conf rule names
+// one. S3 bucket collections are namespaced by filer group; S3 copy passes the
+// prefixed collection explicitly, so direct filer writes keep rule priority.
+func (fs *FilerServer) bucketDefaultCollection(requestURI string) string {
+	if !strings.HasPrefix(requestURI, fs.filer.DirBucketsPath+"/") {
+		return ""
+	}
+	bucket := fs.filer.DetectBucket(util.FullPath(requestURI))
+	if bucket == "" || fs.option.FilerGroup == "" {
+		return bucket
+	}
+	return fmt.Sprintf("%s_%s", fs.option.FilerGroup, bucket)
+}
+
+func (fs *FilerServer) detectStorageOption(ctx context.Context, requestURI, qCollection, qReplication string, ttlSeconds int32, diskType, dataCenter, rack, dataNode string) (*operation.StorageOption, error) {
+
+	rule := fs.filer.FilerConf.MatchStorageRule(requestURI)
+
+	if rule.ReadOnly {
+		// Name the read-only prefix so the caller knows which path is locked and why.
+		// MatchStorageRule leaves LocationPrefix empty when several rules merge; fall back to the request path.
+		prefix := rule.LocationPrefix
+		if prefix == "" {
+			prefix = requestURI
+		}
+		return nil, fmt.Errorf("%w: %s (e.g. bucket over quota)", ErrReadOnly, prefix)
+	}
+
+	// Use local variable instead of mutating shared rule
+	maxFileNameLength := rule.MaxFileNameLength
+	if maxFileNameLength == 0 {
+		maxFileNameLength = fs.filer.MaxFilenameLength
+	}
+
+	// required by buckets folder; direct writes keep path-rule precedence.
+	// S3 copy assigns the grouped bucket collection explicitly.
+	bucketDefaultCollection := fs.bucketDefaultCollection(requestURI)
+
+	if ttlSeconds == 0 {
+		ttl, err := needle.ReadTTL(rule.GetTtl())
+		if err != nil {
+			glog.ErrorfCtx(ctx, "fail to parse %s ttl setting %s: %v", rule.LocationPrefix, rule.Ttl, err)
+		}
+		ttlSeconds = int32(ttl.Minutes()) * 60
+	}
+
+	collection := util.Nvl(qCollection, rule.Collection, bucketDefaultCollection, fs.option.Collection)
+
+	// A placement overlay steers a bound collection's new volumes onto a tier.
+	// It sits between the explicit request and the filer.conf rule: it overrides
+	// the rule but yields to a value the caller asked for outright. Only a
+	// steered collection contributes values; an unsteered one clears them so it
+	// falls straight through to the rule.
+	overlayDisk, overlayReplication, overlayDataCenter, overlaySteered := fs.filer.ResolvePlacement(collection)
+	if !overlaySteered {
+		overlayDisk, overlayReplication, overlayDataCenter = "", "", ""
+	} else {
+		glog.V(4).InfofCtx(ctx, "placement overlay steers collection %s: disk=%q replication=%q dataCenter=%q",
+			collection, overlayDisk, overlayReplication, overlayDataCenter)
+	}
+
+	return &operation.StorageOption{
+		Replication:       util.Nvl(qReplication, overlayReplication, rule.Replication, fs.option.DefaultReplication),
+		Collection:        collection,
+		DataCenter:        util.Nvl(dataCenter, overlayDataCenter, rule.DataCenter, fs.option.DataCenter),
+		Rack:              util.Nvl(rack, rule.Rack, fs.option.Rack),
+		DataNode:          util.Nvl(dataNode, rule.DataNode, fs.option.DataNode),
+		TtlSeconds:        ttlSeconds,
+		DiskType:          util.Nvl(diskType, overlayDisk, rule.DiskType),
+		Fsync:             rule.GetFsync(),
+		VolumeGrowthCount: rule.VolumeGrowthCount,
+		MaxFileNameLength: maxFileNameLength,
+		// A location that survives from a request parameter, a placement
+		// overlay, or the path rule is a contract; only a bare filer default
+		// is a preference that may still be widened.
+		EnforceLocation: dataCenter != "" || overlayDataCenter != "" || rule.DataCenter != "" ||
+			rack != "" || rule.Rack != "" || dataNode != "" || rule.DataNode != "",
+	}, nil
+}
+
+func (fs *FilerServer) detectStorageOption0(ctx context.Context, requestURI, qCollection, qReplication string, qTtl string, diskType string, fsync string, dataCenter, rack, dataNode, saveInside string) (*operation.StorageOption, error) {
+
+	ttl, err := needle.ReadTTL(qTtl)
+	if err != nil {
+		glog.ErrorfCtx(ctx, "fail to parse ttl %s: %v", qTtl, err)
+	}
+
+	so, err := fs.detectStorageOption(ctx, requestURI, qCollection, qReplication, int32(ttl.Minutes())*60, diskType, dataCenter, rack, dataNode)
+	if so != nil {
+		if fsync == "false" {
+			so.Fsync = false
+		} else if fsync == "true" {
+			so.Fsync = true
+		}
+		if saveInside == "true" {
+			so.SaveInside = true
+		} else {
+			so.SaveInside = false
+		}
+	}
+
+	return so, err
 }

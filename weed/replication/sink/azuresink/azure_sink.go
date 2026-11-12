@@ -4,23 +4,32 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net/url"
 	"strings"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/replication/sink"
-	"github.com/chrislusf/seaweedfs/weed/replication/source"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/appendblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage/azure"
+	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
+	"github.com/seaweedfs/seaweedfs/weed/replication/source"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type AzureSink struct {
-	containerURL azblob.ContainerURL
-	container    string
-	dir          string
-	filerSource  *source.FilerSource
+	client        *azblob.Client
+	accountName   string
+	endpoint      string
+	container     string
+	dir           string
+	filerSource   *source.FilerSource
+	isIncremental bool
 }
 
 func init() {
@@ -35,12 +44,23 @@ func (g *AzureSink) GetSinkToDirectory() string {
 	return g.dir
 }
 
-func (g *AzureSink) Initialize(configuration util.Configuration) error {
+func (g *AzureSink) GetDestinationIdentity() string {
+	return g.accountName + "\x00" + g.endpoint + "\x00" + g.container + "\x00" + g.dir
+}
+
+func (g *AzureSink) IsIncremental() bool {
+	return g.isIncremental
+}
+
+func (g *AzureSink) Initialize(configuration util.Configuration, prefix string) error {
+	g.isIncremental = configuration.GetBool(prefix + "is_incremental")
 	return g.initialize(
-		configuration.GetString("account_name"),
-		configuration.GetString("account_key"),
-		configuration.GetString("container"),
-		configuration.GetString("directory"),
+		configuration.GetString(prefix+"account_name"),
+		configuration.GetString(prefix+"account_key"),
+		configuration.GetString(prefix+"client_id"),
+		configuration.GetString(prefix+"endpoint"),
+		configuration.GetString(prefix+"container"),
+		configuration.GetString(prefix+"directory"),
 	)
 }
 
@@ -48,29 +68,35 @@ func (g *AzureSink) SetSourceFiler(s *source.FilerSource) {
 	g.filerSource = s
 }
 
-func (g *AzureSink) initialize(accountName, accountKey, container, dir string) error {
+func (g *AzureSink) initialize(accountName, accountKey, clientID, endpoint, container, dir string) error {
+	g.accountName = accountName
+	g.endpoint = endpoint
 	g.container = container
 	g.dir = dir
 
-	// Use your Storage account's name and key to create a credential object.
-	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
+	client, err := azure.NewAzBlobClient(accountName, accountKey, clientID, endpoint, nil)
 	if err != nil {
-		glog.Fatalf("failed to create Azure credential with account name:%s key:%s", accountName, accountKey)
+		return err
 	}
 
-	// Create a request pipeline that is used to process HTTP(S) requests and responses.
-	p := azblob.NewPipeline(credential, azblob.PipelineOptions{})
+	g.client = client
 
-	// Create an ServiceURL object that wraps the service URL and a request pipeline.
-	u, _ := url.Parse(fmt.Sprintf("https://%s.blob.core.windows.net", accountName))
-	serviceURL := azblob.NewServiceURL(*u, p)
-
-	g.containerURL = serviceURL.NewContainerURL(g.container)
+	// Validate that the container exists early to catch configuration errors
+	containerClient := client.ServiceClient().NewContainerClient(container)
+	ctxValidate, cancelValidate := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+	defer cancelValidate()
+	_, err = containerClient.GetProperties(ctxValidate, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.ContainerNotFound) {
+			return fmt.Errorf("Azure container '%s' does not exist. Please create it first", container)
+		}
+		return fmt.Errorf("failed to validate Azure container '%s': %w", container, err)
+	}
 
 	return nil
 }
 
-func (g *AzureSink) DeleteEntry(ctx context.Context, key string, isDirectory, deleteIncludeChunks bool) error {
+func (g *AzureSink) DeleteEntry(key string, isDirectory, deleteIncludeChunks bool, signatures []int32) error {
 
 	key = cleanKey(key)
 
@@ -78,16 +104,24 @@ func (g *AzureSink) DeleteEntry(ctx context.Context, key string, isDirectory, de
 		key = key + "/"
 	}
 
-	if _, err := g.containerURL.NewBlobURL(key).Delete(ctx,
-		azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{}); err != nil {
-		return fmt.Errorf("azure delete %s/%s: %v", g.container, key, err)
+	blobClient := g.client.ServiceClient().NewContainerClient(g.container).NewBlobClient(key)
+	ctxDelete, cancelDelete := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+	defer cancelDelete()
+	_, err := blobClient.Delete(ctxDelete, &blob.DeleteOptions{
+		DeleteSnapshots: to.Ptr(blob.DeleteSnapshotsOptionTypeInclude),
+	})
+	if err != nil {
+		// Make delete idempotent - don't return error if blob doesn't exist
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil
+		}
+		return fmt.Errorf("azure delete %s/%s: %w", g.container, key, err)
 	}
 
 	return nil
-
 }
 
-func (g *AzureSink) CreateEntry(ctx context.Context, key string, entry *filer_pb.Entry) error {
+func (g *AzureSink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int32) error {
 
 	key = cleanKey(key)
 
@@ -95,52 +129,168 @@ func (g *AzureSink) CreateEntry(ctx context.Context, key string, entry *filer_pb
 		return nil
 	}
 
-	totalSize := filer2.TotalSize(entry.Chunks)
-	chunkViews := filer2.ViewFromChunks(entry.Chunks, 0, int(totalSize))
-
-	// Create a URL that references a to-be-created blob in your
-	// Azure Storage account's container.
-	appendBlobURL := g.containerURL.NewAppendBlobURL(key)
-
-	_, err := appendBlobURL.Create(ctx, azblob.BlobHTTPHeaders{}, azblob.Metadata{}, azblob.BlobAccessConditions{})
+	totalSize := filer.FileSize(entry)
+	chunkViews, err := filer.ViewFromChunks(context.Background(), g.filerSource.LookupFileId, entry.GetChunks(), 0, int64(totalSize))
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve chunks of %s: %w", key, err)
 	}
 
-	for _, chunk := range chunkViews {
+	// Create append blob client
+	appendBlobClient := g.client.ServiceClient().NewContainerClient(g.container).NewAppendBlobClient(key)
 
-		fileUrl, err := g.filerSource.LookupFileId(ctx, chunk.FileId)
-		if err != nil {
-			return err
+	// Try to create the blob first (without access conditions for initial creation)
+	ctxCreate, cancelCreate := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+	defer cancelCreate()
+	_, err = appendBlobClient.Create(ctxCreate, nil)
+
+	needsWrite := true
+	freshlyCreated := false
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobAlreadyExists) {
+			// Handle existing blob - check if overwrite is needed and perform it if necessary
+			var handleErr error
+			needsWrite, handleErr = g.handleExistingBlob(appendBlobClient, key, entry, totalSize)
+			if handleErr != nil {
+				return handleErr
+			}
+			// handleExistingBlob recreates the blob when needsWrite is true
+			freshlyCreated = needsWrite
+		} else {
+			return fmt.Errorf("azure create append blob %s/%s: %w", g.container, key, err)
 		}
+	} else {
+		freshlyCreated = true
+	}
 
-		var writeErr error
-		_, readErr := util.ReadUrlAsStream(fileUrl, chunk.Offset, int(chunk.Size), func(data []byte) {
-			_, writeErr = appendBlobURL.AppendBlock(ctx, bytes.NewReader(data), azblob.AppendBlobAccessConditions{}, nil)
-		})
+	// If we don't need to write (blob is up-to-date), return early
+	if !needsWrite {
+		return nil
+	}
 
-		if readErr != nil {
-			return readErr
-		}
-		if writeErr != nil {
+	// cleanupOnError deletes a freshly created blob when content write fails,
+	// preventing empty blobs from being left behind.
+	cleanupOnError := func(writeErr error) error {
+		if !freshlyCreated {
 			return writeErr
 		}
+		glog.Warningf("azure sink: cleaning up empty blob %s/%s after write failure: %v", g.container, key, writeErr)
+		ctxCleanup, cancelCleanup := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+		defer cancelCleanup()
+		if _, delErr := appendBlobClient.Delete(ctxCleanup, nil); delErr != nil {
+			if !bloberror.HasCode(delErr, bloberror.BlobNotFound) {
+				glog.Warningf("azure sink: failed to clean up blob %s/%s: %v", g.container, key, delErr)
+			}
+		}
+		return writeErr
+	}
 
+	writeFunc := func(data []byte) error {
+		ctxWrite, cancelWrite := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+		defer cancelWrite()
+		_, writeErr := appendBlobClient.AppendBlock(ctxWrite, streaming.NopCloser(bytes.NewReader(data)), &appendblob.AppendBlockOptions{})
+		return writeErr
+	}
+
+	if len(entry.Content) > 0 {
+		content, err := repl_util.MaybeDecryptContent(entry.Content, entry)
+		if err != nil {
+			return cleanupOnError(fmt.Errorf("decrypt inline SSE content: %w", err))
+		}
+		if err := writeFunc(content); err != nil {
+			return cleanupOnError(err)
+		}
+		return nil
+	}
+
+	if err := repl_util.CopyFromChunkViews(chunkViews, g.filerSource, writeFunc, entry); err != nil {
+		return cleanupOnError(err)
 	}
 
 	return nil
-
 }
 
-func (g *AzureSink) UpdateEntry(ctx context.Context, key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool) (foundExistingEntry bool, err error) {
+// handleExistingBlob determines whether an existing blob needs to be overwritten and performs the overwrite if necessary.
+// It returns:
+//   - needsWrite: true if the caller should write data to the blob, false if the blob is already up-to-date
+//   - error: any error encountered during the operation
+func (g *AzureSink) handleExistingBlob(appendBlobClient *appendblob.Client, key string, entry *filer_pb.Entry, totalSize uint64) (needsWrite bool, err error) {
+	// Get the blob's properties to decide whether to overwrite.
+	// Use a timeout to fail fast on network issues.
+	ctxProps, cancelProps := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+	defer cancelProps()
+	props, propErr := appendBlobClient.GetProperties(ctxProps, nil)
+
+	// Fail fast if we cannot fetch properties - we should not proceed to delete without knowing the blob state.
+	if propErr != nil {
+		return false, fmt.Errorf("azure get properties %s/%s: %w", g.container, key, propErr)
+	}
+
+	// Check if we can skip writing based on modification time and size.
+	if entry.Attributes != nil && entry.Attributes.Mtime > 0 && props.LastModified != nil && props.ContentLength != nil {
+		const clockSkewTolerance = int64(2) // seconds - allow small clock differences
+		remoteMtime := props.LastModified.Unix()
+		localMtime := entry.Attributes.Mtime
+		// Skip if remote is newer/same (within skew tolerance) and has the SAME size.
+		// This prevents skipping partial/corrupted files that may have a newer mtime.
+		if remoteMtime >= localMtime-clockSkewTolerance && *props.ContentLength == int64(totalSize) {
+			glog.V(2).Infof("skip overwriting %s/%s: remote is up-to-date (remote mtime: %d >= local mtime: %d, size: %d)",
+				g.container, key, remoteMtime, localMtime, *props.ContentLength)
+			return false, nil
+		}
+	}
+
+	// Blob is empty or outdated - we need to delete and recreate it.
+	// REQUIRE ETag for conditional delete to avoid race conditions and data loss.
+	if props.ETag == nil {
+		return false, fmt.Errorf("azure blob %s/%s: missing ETag; refusing to delete without conditional", g.container, key)
+	}
+
+	deleteOpts := &blob.DeleteOptions{
+		DeleteSnapshots: to.Ptr(blob.DeleteSnapshotsOptionTypeInclude),
+		AccessConditions: &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+				IfMatch: props.ETag,
+			},
+		},
+	}
+
+	// Delete existing blob with conditional delete and timeout.
+	ctxDel, cancelDel := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+	defer cancelDel()
+	_, delErr := appendBlobClient.Delete(ctxDel, deleteOpts)
+
+	if delErr != nil {
+		// If the precondition fails, the blob was modified by another process after we checked it.
+		// Failing here is safe; replication will retry.
+		if bloberror.HasCode(delErr, bloberror.ConditionNotMet) {
+			return false, fmt.Errorf("azure blob %s/%s was modified concurrently, preventing overwrite: %w", g.container, key, delErr)
+		}
+		// Ignore BlobNotFound, as the goal is to delete it anyway.
+		if !bloberror.HasCode(delErr, bloberror.BlobNotFound) {
+			return false, fmt.Errorf("azure delete existing blob %s/%s: %w", g.container, key, delErr)
+		}
+	}
+
+	// Recreate the blob with timeout.
+	ctxRecreate, cancelRecreate := context.WithTimeout(context.Background(), azure.DefaultAzureOpTimeout)
+	defer cancelRecreate()
+	_, createErr := appendBlobClient.Create(ctxRecreate, nil)
+
+	if createErr != nil {
+		// It's possible another process recreated it after our delete.
+		// Failing is safe, as a retry of the whole function will handle it.
+		return false, fmt.Errorf("azure recreate append blob %s/%s: %w", g.container, key, createErr)
+	}
+
+	return true, nil
+}
+
+func (g *AzureSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool, signatures []int32) (foundExistingEntry bool, err error) {
 	key = cleanKey(key)
-	// TODO improve efficiency
-	return false, nil
+	return true, g.CreateEntry(key, newEntry, signatures)
 }
 
 func cleanKey(key string) string {
-	if strings.HasPrefix(key, "/") {
-		key = key[1:]
-	}
-	return key
+	// Remove all leading slashes (TrimLeft handles multiple slashes, unlike TrimPrefix)
+	return strings.TrimLeft(key, "/")
 }

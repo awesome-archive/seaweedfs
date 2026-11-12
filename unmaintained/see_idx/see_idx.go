@@ -7,9 +7,12 @@ import (
 	"path"
 	"strconv"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -25,6 +28,8 @@ This is to see content in .idx files.
 */
 func main() {
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
+
 	fileName := strconv.Itoa(*fixVolumeId)
 	if *fixVolumeCollection != "" {
 		fileName = *fixVolumeCollection + "_" + fileName
@@ -35,8 +40,8 @@ func main() {
 	}
 	defer indexFile.Close()
 
-	idx.WalkIndexFile(indexFile, func(key types.NeedleId, offset types.Offset, size uint32) error {
-		fmt.Printf("key:%v offset:%v size:%v\n", key, offset, size)
+	idx.WalkIndexFile(indexFile, 0, func(key types.NeedleId, offset types.Offset, size types.Size) error {
+		fmt.Printf("key:%v offset:%v size:%v(%v)\n", key, offset, size, util.BytesToHumanReadable(uint64(size)))
 		return nil
 	})
 

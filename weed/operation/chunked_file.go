@@ -1,20 +1,23 @@
 package operation
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"sort"
+	"strings"
+	"sync"
 
 	"google.golang.org/grpc"
 
-	"sync"
-
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -41,23 +44,25 @@ type ChunkManifest struct {
 
 // seekable chunked file reader
 type ChunkedFileReader struct {
-	Manifest *ChunkManifest
-	Master   string
-	pos      int64
-	pr       *io.PipeReader
-	pw       *io.PipeWriter
-	mutex    sync.Mutex
+	totalSize      int64
+	chunkList      []*ChunkInfo
+	master         pb.ServerAddress
+	pos            int64
+	pr             *io.PipeReader
+	pw             *io.PipeWriter
+	mutex          sync.Mutex
+	grpcDialOption grpc.DialOption
 }
 
 func (s ChunkList) Len() int           { return len(s) }
 func (s ChunkList) Less(i, j int) bool { return s[i].Offset < s[j].Offset }
 func (s ChunkList) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
-func LoadChunkManifest(buffer []byte, isGzipped bool) (*ChunkManifest, error) {
-	if isGzipped {
+func LoadChunkManifest(buffer []byte, isCompressed bool) (*ChunkManifest, error) {
+	if isCompressed {
 		var err error
-		if buffer, err = util.UnGzipData(buffer); err != nil {
-			return nil, err
+		if buffer, err = util.DecompressData(buffer); err != nil {
+			glog.V(0).Infof("fail to decompress chunk manifest: %v", err)
 		}
 	}
 	cm := ChunkManifest{}
@@ -72,16 +77,14 @@ func (cm *ChunkManifest) Marshal() ([]byte, error) {
 	return json.Marshal(cm)
 }
 
-func (cm *ChunkManifest) DeleteChunks(master string, grpcDialOption grpc.DialOption) error {
+func (cm *ChunkManifest) DeleteChunks(masterFn GetMasterFn, usePublicUrl bool, grpcDialOption grpc.DialOption) error {
 	var fileIds []string
 	for _, ci := range cm.Chunks {
 		fileIds = append(fileIds, ci.Fid)
 	}
-	results, err := DeleteFiles(master, grpcDialOption, fileIds)
-	if err != nil {
-		glog.V(0).Infof("delete %+v: %v", fileIds, err)
-		return fmt.Errorf("chunk delete: %v", err)
-	}
+	results := DeleteFileIds(masterFn, usePublicUrl, grpcDialOption, fileIds)
+
+	// Check for any errors in results
 	for _, result := range results {
 		if result.Error != "" {
 			glog.V(0).Infof("delete file %+v: %v", result.FileId, result.Error)
@@ -92,23 +95,23 @@ func (cm *ChunkManifest) DeleteChunks(master string, grpcDialOption grpc.DialOpt
 	return nil
 }
 
-func readChunkNeedle(fileUrl string, w io.Writer, offset int64) (written int64, e error) {
-	req, err := http.NewRequest("GET", fileUrl, nil)
+func readChunkNeedle(fileUrl string, w io.Writer, offset int64, size int64, jwt string) (written int64, e error) {
+	req, err := http.NewRequest(http.MethodGet, fileUrl, nil)
 	if err != nil {
 		return written, err
 	}
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
+	if jwt != "" {
+		req.Header.Set("Authorization", security.BearerPrefix+jwt)
+	}
 
-	resp, err := util.Do(req)
+	resp, err := util_http.Do(req)
 	if err != nil {
 		return written, err
 	}
-	defer func() {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}()
+	defer util_http.CloseResponse(resp)
 
 	switch resp.StatusCode {
 	case http.StatusRequestedRangeNotSatisfiable:
@@ -120,22 +123,40 @@ func readChunkNeedle(fileUrl string, w io.Writer, offset int64) (written int64, 
 	case http.StatusPartialContent:
 		break
 	default:
-		return written, fmt.Errorf("Read chunk needle error: [%d] %s", resp.StatusCode, fileUrl)
+		return written, util_http.StatusError(fileUrl, resp)
 
 	}
-	return io.Copy(w, resp.Body)
+	written, e = io.CopyN(w, resp.Body, size)
+	if e == io.EOF {
+		e = fmt.Errorf("%s: %d of %d bytes: %w", fileUrl, written, size, io.ErrUnexpectedEOF)
+	}
+	return written, e
+}
+
+func NewChunkedFileReader(chunkList []*ChunkInfo, master pb.ServerAddress, grpcDialOption grpc.DialOption) *ChunkedFileReader {
+	var totalSize int64
+	for _, chunk := range chunkList {
+		totalSize += chunk.Size
+	}
+	sort.Sort(ChunkList(chunkList))
+	return &ChunkedFileReader{
+		totalSize:      totalSize,
+		chunkList:      chunkList,
+		master:         master,
+		grpcDialOption: grpcDialOption,
+	}
 }
 
 func (cf *ChunkedFileReader) Seek(offset int64, whence int) (int64, error) {
 	var err error
 	switch whence {
-	case 0:
-	case 1:
+	case io.SeekStart:
+	case io.SeekCurrent:
 		offset += cf.pos
-	case 2:
-		offset = cf.Manifest.Size - offset
+	case io.SeekEnd:
+		offset = cf.totalSize + offset
 	}
-	if offset > cf.Manifest.Size {
+	if offset > cf.totalSize {
 		err = ErrInvalidRange
 	}
 	if cf.pos != offset {
@@ -146,10 +167,9 @@ func (cf *ChunkedFileReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (cf *ChunkedFileReader) WriteTo(w io.Writer) (n int64, err error) {
-	cm := cf.Manifest
 	chunkIndex := -1
 	chunkStartOffset := int64(0)
-	for i, ci := range cm.Chunks {
+	for i, ci := range cf.chunkList {
 		if cf.pos >= ci.Offset && cf.pos < ci.Offset+ci.Size {
 			chunkIndex = i
 			chunkStartOffset = cf.pos - ci.Offset
@@ -159,23 +179,68 @@ func (cf *ChunkedFileReader) WriteTo(w io.Writer) (n int64, err error) {
 	if chunkIndex < 0 {
 		return n, ErrInvalidRange
 	}
-	for ; chunkIndex < cm.Chunks.Len(); chunkIndex++ {
-		ci := cm.Chunks[chunkIndex]
-		// if we need read date from local volume server first?
-		fileUrl, lookupError := LookupFileId(cf.Master, ci.Fid)
-		if lookupError != nil {
-			return n, lookupError
-		}
-		if wn, e := readChunkNeedle(fileUrl, w, chunkStartOffset); e != nil {
+	for ; chunkIndex < len(cf.chunkList); chunkIndex++ {
+		wn, e := cf.readChunk(cf.chunkList[chunkIndex], w, chunkStartOffset)
+		n += wn
+		cf.pos += wn
+		if e != nil {
 			return n, e
-		} else {
-			n += wn
-			cf.pos += wn
 		}
-
 		chunkStartOffset = 0
 	}
 	return n, nil
+}
+
+// readChunk reads the chunk from the first replica that serves it. A failure
+// drops the volume's cached locations, and once every cached replica has
+// failed the master is asked again. A replica that already sent part of the
+// chunk is not continued elsewhere: a volume server streams a needle before
+// its checksum is verified, so those bytes may be the corrupt ones.
+func (cf *ChunkedFileReader) readChunk(ci *ChunkInfo, w io.Writer, offset int64) (written int64, err error) {
+	masterFn := func(_ context.Context) pb.ServerAddress {
+		return cf.master
+	}
+	vid, _, _ := strings.Cut(ci.Fid, ",")
+	dst := &writeErrorRecorder{Writer: w}
+	tried := make(map[string]bool)
+	for range 2 {
+		fileUrls, jwt, lookupError := lookupFileIdUrls(masterFn, cf.grpcDialOption, ci.Fid)
+		if lookupError != nil {
+			if err == nil {
+				err = lookupError
+			}
+			return 0, err
+		}
+		for _, fileUrl := range fileUrls {
+			if tried[fileUrl] {
+				continue
+			}
+			tried[fileUrl] = true
+			written, err = readChunkNeedle(fileUrl, dst, offset, ci.Size-offset, jwt)
+			if err == nil || dst.err != nil {
+				return written, err
+			}
+			glog.V(0).Infof("read chunk %s from %s: %v", ci.Fid, fileUrl, err)
+			InvalidateVolumeIdLocationCache(vid)
+			if written > 0 {
+				return written, err
+			}
+		}
+	}
+	return 0, err
+}
+
+type writeErrorRecorder struct {
+	io.Writer
+	err error
+}
+
+func (r *writeErrorRecorder) Write(p []byte) (int, error) {
+	n, err := r.Writer.Write(p)
+	if err != nil {
+		r.err = err
+	}
+	return n, err
 }
 
 func (cf *ChunkedFileReader) ReadAt(p []byte, off int64) (n int, err error) {

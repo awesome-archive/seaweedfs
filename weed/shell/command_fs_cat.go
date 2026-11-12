@@ -4,15 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_server "github.com/chrislusf/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
-	commands = append(commands, &commandFsCat{})
+	Commands = append(Commands, &commandFsCat{})
 }
 
 type commandFsCat struct {
@@ -25,44 +24,48 @@ func (c *commandFsCat) Name() string {
 func (c *commandFsCat) Help() string {
 	return `stream the file content on to the screen
 
-	fs.cat /dir/
 	fs.cat /dir/file_name
-	fs.cat /dir/file_prefix
-	fs.cat http://<filer_server>:<port>/dir/
-	fs.cat http://<filer_server>:<port>/dir/file_name
-	fs.cat http://<filer_server>:<port>/dir/file_prefix
 `
 }
 
-func (c *commandFsCat) Do(args []string, commandEnv *commandEnv, writer io.Writer) (err error) {
+func (c *commandFsCat) HasTag(CommandTag) bool {
+	return false
+}
 
-	input := findInputDirectory(args)
+func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
-	filerServer, filerPort, path, err := commandEnv.parseUrl(input)
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
+
+	path, err := commandEnv.parseUrl(findInputDirectory(args))
 	if err != nil {
 		return err
 	}
 
-	ctx := context.Background()
-
-	if commandEnv.isDirectory(ctx, filerServer, filerPort, path) {
+	if commandEnv.isDirectory(path) {
 		return fmt.Errorf("%s is a directory", path)
 	}
 
-	dir, name := filer2.FullPath(path).DirAndName()
+	dir, name := util.FullPath(path).DirAndName()
 
-	return commandEnv.withFilerClient(ctx, filerServer, filerPort, func(client filer_pb.SeaweedFilerClient) error {
+	return commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
 		request := &filer_pb.LookupDirectoryEntryRequest{
 			Name:      name,
 			Directory: dir,
 		}
-		respLookupEntry, err := client.LookupDirectoryEntry(ctx, request)
+		respLookupEntry, err := filer_pb.LookupEntry(context.Background(), client, request)
 		if err != nil {
 			return err
 		}
 
-		return weed_server.StreamContent(commandEnv.masterClient, writer, respLookupEntry.Entry.Chunks, 0, math.MaxInt32)
+		if len(respLookupEntry.Entry.Content) > 0 {
+			_, err = writer.Write(respLookupEntry.Entry.Content)
+			return err
+		}
+
+		return filer.StreamContent(commandEnv.MasterClient, writer, respLookupEntry.Entry.GetChunks(), 0, int64(filer.FileSize(respLookupEntry.Entry)))
 
 	})
 

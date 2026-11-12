@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"mime/multipart"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -31,12 +32,12 @@ type stat struct {
 }
 
 func main() {
-
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
 	var fileNames []string
 
-	files, err := ioutil.ReadDir(*dir)
+	files, err := os.ReadDir(*dir)
 	if err != nil {
 		log.Fatalf("fail to read dir %v: %v", *dir, err)
 	}
@@ -52,8 +53,6 @@ func main() {
 	for x := 0; x < *concurrency; x++ {
 		wg.Add(1)
 
-		client := &http.Client{}
-
 		go func() {
 			defer wg.Done()
 			rand.Shuffle(len(fileNames), func(i, j int) {
@@ -61,7 +60,7 @@ func main() {
 			})
 			for t := 0; t < *times; t++ {
 				for _, filename := range fileNames {
-					if size, err := uploadFileToFiler(client, filename, *destination); err == nil {
+					if size, err := uploadFileToFiler(filename, *destination); err == nil {
 						statsChan <- stat{
 							size: size,
 						}
@@ -73,6 +72,7 @@ func main() {
 
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
 
 		var lastTime time.Time
 		var counter, size int64
@@ -99,7 +99,7 @@ func main() {
 
 }
 
-func uploadFileToFiler(client *http.Client, filename, destination string) (size int64, err error) {
+func uploadFileToFiler(filename, destination string) (size int64, err error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		panic(err)
@@ -130,10 +130,14 @@ func uploadFileToFiler(client *http.Client, filename, destination string) (size 
 
 	uri := destination + file.Name()
 
-	request, err := http.NewRequest("POST", uri, body)
+	request, err := http.NewRequest(http.MethodPost, uri, body)
+	if err != nil {
+		return 0, fmt.Errorf("http POST %s: %v", uri, err)
+	}
+
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := client.Do(request)
+	resp, err := util_http.GetGlobalHttpClient().Do(request)
 	if err != nil {
 		return 0, fmt.Errorf("http POST %s: %v", uri, err)
 	} else {
@@ -142,7 +146,7 @@ func uploadFileToFiler(client *http.Client, filename, destination string) (size 
 		if err != nil {
 			return 0, fmt.Errorf("read http POST %s response: %v", uri, err)
 		}
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 

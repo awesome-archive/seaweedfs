@@ -1,11 +1,12 @@
 package needle
 
 import (
-	"crypto/md5"
 	"fmt"
+	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/klauspost/crc32"
+	"hash/crc32"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var table = crc32.MakeTable(crc32.Castagnoli)
@@ -20,6 +21,7 @@ func (c CRC) Update(b []byte) CRC {
 	return CRC(crc32.Update(uint32(c), table, b))
 }
 
+// Value Deprecated. Just use the raw uint32 value to compare.
 func (c CRC) Value() uint32 {
 	return uint32(c>>15|c<<17) + 0xa282ead8
 }
@@ -30,12 +32,7 @@ func (n *Needle) Etag() string {
 	return fmt.Sprintf("%x", bits)
 }
 
-func (n *Needle) MD5() string {
-
-	hash := md5.New()
-
-	hash.Write(n.Data)
-
-	return fmt.Sprintf("%x", hash.Sum(nil))
-
+type CRCwriter struct {
+	crc CRC
+	w   io.Writer
 }

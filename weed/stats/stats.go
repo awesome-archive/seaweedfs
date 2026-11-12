@@ -62,12 +62,6 @@ func ConnectionOpen() {
 func ConnectionClose() {
 	Chan.Connections <- NewTimedValue(time.Now(), -1)
 }
-func RequestOpen() {
-	Chan.Requests <- NewTimedValue(time.Now(), 1)
-}
-func RequestClose() {
-	Chan.Requests <- NewTimedValue(time.Now(), -1)
-}
 func AssignRequest() {
 	Chan.AssignRequests <- NewTimedValue(time.Now(), 1)
 }
@@ -100,8 +94,6 @@ func (ss *ServerStats) Start() {
 			ss.ReadRequests.Add(tv)
 		case tv := <-Chan.WriteRequests:
 			ss.WriteRequests.Add(tv)
-		case tv := <-Chan.ReadRequests:
-			ss.ReadRequests.Add(tv)
 		case tv := <-Chan.DeleteRequests:
 			ss.DeleteRequests.Add(tv)
 		case tv := <-Chan.BytesIn:

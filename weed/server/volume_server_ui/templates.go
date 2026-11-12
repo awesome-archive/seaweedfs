@@ -1,10 +1,46 @@
-package master_ui
+package volume_server_ui
 
 import (
+	_ "embed"
+	"fmt"
 	"html/template"
 	"strconv"
 	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
+
+func percentFrom(total uint64, part_of uint64) string {
+	return fmt.Sprintf("%.2f", (float64(part_of)/float64(total))*100)
+}
+
+func bytesToHumanReadable(b interface{}) string {
+	switch v := b.(type) {
+	case uint64:
+		return util.BytesToHumanReadable(v)
+	case int64:
+		if v < 0 {
+			return fmt.Sprintf("%d B", v)
+		}
+		return util.BytesToHumanReadable(uint64(v))
+	case int:
+		if v < 0 {
+			return fmt.Sprintf("%d B", v)
+		}
+		return util.BytesToHumanReadable(uint64(v))
+	case uint32:
+		return util.BytesToHumanReadable(uint64(v))
+	case int32:
+		if v < 0 {
+			return fmt.Sprintf("%d B", v)
+		}
+		return util.BytesToHumanReadable(uint64(v))
+	case uint:
+		return util.BytesToHumanReadable(uint64(v))
+	default:
+		return fmt.Sprintf("%v", b)
+	}
+}
 
 func join(data []int64) string {
 	var ret []string
@@ -15,120 +51,13 @@ func join(data []int64) string {
 }
 
 var funcMap = template.FuncMap{
-	"join": join,
+	"join":                 join,
+	"bytesToHumanReadable": bytesToHumanReadable,
+	"percentFrom":          percentFrom,
+	"isNotEmpty":           util.IsNotEmpty,
 }
 
-var StatusTpl = template.Must(template.New("status").Funcs(funcMap).Parse(`<!DOCTYPE html>
-<html>
-  <head>
-    <title>SeaweedFS {{ .Version }}</title>
-	<link rel="stylesheet" href="/seaweedfsstatic/bootstrap/3.3.1/css/bootstrap.min.css">
-	<script type="text/javascript" src="/seaweedfsstatic/javascript/jquery-2.1.3.min.js"></script>
-	<script type="text/javascript" src="/seaweedfsstatic/javascript/jquery-sparklines/2.1.2/jquery.sparkline.min.js"></script>
-    <script type="text/javascript">
-    $(function() {
-		var periods = ['second', 'minute', 'hour', 'day'];
-		for (i = 0; i < periods.length; i++) { 
-		    var period = periods[i];
-	        $('.inlinesparkline-'+period).sparkline('html', {
-				type: 'line', 
-				barColor: 'red', 
-				tooltipSuffix:' request per '+period,
-			}); 
-		}
-    });
-    </script>
-	<style>
-	#jqstooltip{
-		height: 28px !important;
-		width: 150px !important;
-	}
-	</style>
-  </head>
-  <body>
-    <div class="container">
-      <div class="page-header">
-	    <h1>
-          <a href="https://github.com/chrislusf/seaweedfs"><img src="/seaweedfsstatic/seaweed50x50.png"></img></a>
-          SeaweedFS <small>{{ .Version }}</small>
-	    </h1>
-      </div>
+//go:embed volume.html
+var volumeHtml string
 
-      <div class="row">
-        <div class="col-sm-6">          
-    	  <h2>Disk Stats</h2>
-          <table class="table table-condensed table-striped">
-          {{ range .DiskStatuses }}
-            <tr>
-              <th>{{ .Dir }}</th>
-              <td>{{ .Free }} Bytes Free</td>
-            </tr>
-          {{ end }}
-          </table>
-        </div>
-
-        <div class="col-sm-6">
-          <h2>System Stats</h2>
-          <table class="table table-condensed table-striped">
-            <tr>
-              <th>Masters</th>
-              <td>{{.Masters}}</td>
-            </tr>
-            <tr>
-              <th>Weekly # ReadRequests</th>
-              <td><span class="inlinesparkline-day">{{ .Counters.ReadRequests.WeekCounter.ToList | join }}</span></td>
-            </tr>
-            <tr>
-              <th>Daily # ReadRequests</th>
-              <td><span class="inlinesparkline-hour">{{ .Counters.ReadRequests.DayCounter.ToList | join }}</span></td>
-            </tr>
-            <tr>
-              <th>Hourly # ReadRequests</th>
-              <td><span class="inlinesparkline-minute">{{ .Counters.ReadRequests.HourCounter.ToList | join }}</span></td>
-            </tr>
-            <tr>
-              <th>Last Minute # ReadRequests</th>
-              <td><span class="inlinesparkline-second">{{ .Counters.ReadRequests.MinuteCounter.ToList | join }}</span></td>
-            </tr>
-          {{ range $key, $val := .Stats }}
-            <tr>
-              <th>{{ $key }}</th>
-              <td>{{ $val }}</td>
-            </tr>
-          {{ end }}
-          </table>
-        </div>
-      </div>
-
-      <div class="row">
-        <h2>Volumes</h2>
-        <table class="table table-striped">
-          <thead>
-            <tr>
-              <th>Id</th>
-              <th>Collection</th>
-              <th>Size</th>
-              <th>Files</th>
-              <th>Trash</th>
-              <th>TTL</th>
-            </tr>
-          </thead>
-          <tbody>
-          {{ range .Volumes }}
-            <tr>
-              <td><code>{{ .Id }}</code></td>
-              <td>{{ .Collection }}</td>
-              <td>{{ .Size }} Bytes</td>
-              <td>{{ .FileCount }}</td>
-              <td>{{ .DeleteCount }} / {{.DeletedByteCount}} Bytes</td>
-              <td>{{ .Ttl }}</td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-
-    </div>
-  </body>
-</html>
-`))
+var StatusTpl = template.Must(template.New("status").Funcs(funcMap).Parse(volumeHtml))

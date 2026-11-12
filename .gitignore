@@ -2,6 +2,7 @@
 vendor
 tags
 *.swp
+.claude/
 ### OSX template
 .DS_Store
 .AppleDouble
@@ -55,6 +56,8 @@ Temporary Items
 # Mongo Explorer plugin:
 # .idea/mongoSettings.xml
 
+## vscode
+.vscode
 ## File-based project format:
 *.ipr
 *.iws
@@ -75,8 +78,77 @@ com_crashlytics_export_strings.xml
 crashlytics.properties
 crashlytics-build.properties
 
+workspace/
+
 test_data
 build
 target
 *.class
 other/java/hdfs/dependency-reduced-pom.xml
+
+# binary file
+weed/weed
+docker/weed
+
+# test generated files
+weed/*/*.jpg
+docker/weed_sub
+docker/weed_pub
+weed/mq/schema/example.parquet
+docker/agent_sub_record
+test/mq/bin/consumer
+test/mq/bin/producer
+test/producer
+bin/weed
+weed_binary
+/test/s3/copying/filerldb2
+/filerldb2
+/test/s3/retention/test-volume-data
+test/s3/cors/weed-test.log
+test/s3/cors/weed-server.pid
+/test/s3/cors/test-volume-data
+test/s3/cors/cors.test
+/test/s3/retention/filerldb2
+test/s3/retention/weed-server.pid
+test/s3/retention/weed-test.log
+/test/s3/versioning/test-volume-data
+test/s3/versioning/weed-test.log
+/docker/admin_integration/data
+docker/agent_pub_record
+docker/admin_integration/weed-local
+/test/s3/encryption/filerldb2
+/test/s3/sse/filerldb2
+test/s3/sse/weed-test.log
+ADVANCED_IAM_DEVELOPMENT_PLAN.md
+/test/s3/iam/test-volume-data
+*.log
+weed-iam
+test/kafka/kafka-client-loadtest/weed-linux-arm64
+/test/tus/filerldb2
+coverage.out
+/test/s3/remote_cache/test-primary-data
+/test/s3/remote_cache/test-remote-data
+test/s3/remote_cache/remote-server.pid
+test/s3/remote_cache/primary-server.pid
+/test/erasure_coding/filerldb2
+/test/s3/cors/test-mini-data
+/test/s3/filer_group/test-volume-data
+
+# ID and PID files
+*.id
+*.pid
+test/s3/iam/.test_env
+/test/erasure_coding/admin_dockertest/tmp
+/test/erasure_coding/admin_dockertest/task_logs
+weed_bin
+telemetry/server/telemetry-server
+.aider*
+/seaweed-volume/docs
+__pycache__/
+/test/s3vectors/weed
+/test/s3vectors/weed-vector
+/test/s3vectors/weed-vector-worker
+/test/s3vectors/weed-vector-cli
+/test/s3vectors/weed-worker
+/test/s3vectors/weed-volume
+.pytest_cache/

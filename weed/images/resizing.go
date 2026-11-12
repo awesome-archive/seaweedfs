@@ -6,10 +6,13 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
-
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/disintegration/imaging"
 	"io"
+
+	"github.com/cognusion/imaging"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+
+	_ "golang.org/x/image/webp"
 )
 
 func Resized(ext string, read io.ReadSeeker, width, height int, mode string) (resized io.ReadSeeker, w int, h int) {
@@ -35,6 +38,7 @@ func Resized(ext string, read io.ReadSeeker, width, height int, mode string) (re
 				}
 			}
 		} else {
+			read.Seek(0, 0)
 			return read, bounds.Dx(), bounds.Dy()
 		}
 		var buf bytes.Buffer
@@ -45,6 +49,9 @@ func Resized(ext string, read io.ReadSeeker, width, height int, mode string) (re
 			jpeg.Encode(&buf, dstImage, nil)
 		case ".gif":
 			gif.Encode(&buf, dstImage, nil)
+		case ".webp":
+			// Webp does not have golang encoder.
+			png.Encode(&buf, dstImage)
 		}
 		return bytes.NewReader(buf.Bytes()), dstImage.Bounds().Dx(), dstImage.Bounds().Dy()
 	} else {

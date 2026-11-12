@@ -1,0 +1,272 @@
+package dash
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+type fakeAdminLocker struct {
+	releaseDelay   time.Duration
+	requestStarted chan struct{}
+	requestGate    <-chan struct{}
+
+	mu       sync.Mutex
+	requests []time.Time
+	releases []time.Time // recorded when ReleaseLock returns
+}
+
+func (f *fakeAdminLocker) RequestLock(clientName string) {
+	if f.requestStarted != nil {
+		close(f.requestStarted)
+	}
+	if f.requestGate != nil {
+		<-f.requestGate
+	}
+	f.mu.Lock()
+	f.requests = append(f.requests, time.Now())
+	f.mu.Unlock()
+}
+
+func TestAdminLockManagerStatusWhileWaiting(t *testing.T) {
+	for _, reason := range []string{"plugin scheduler vacuum detection", "plugin scheduler vacuum job vacuum-1"} {
+		t.Run(reason, func(t *testing.T) {
+			gate := make(chan struct{})
+			locker := &fakeAdminLocker{requestStarted: make(chan struct{}), requestGate: gate}
+			m := newTestLockManager(locker, 0, time.Minute)
+			done := make(chan func(), 1)
+			go func() {
+				release, _ := m.Acquire(reason)
+				done <- release
+			}()
+			<-locker.requestStarted
+			status := m.Status()
+			close(gate)
+			release := <-done
+			defer release()
+			if len(status.Waiters) != 1 || status.Waiters[0].Reason != reason || status.Waiters[0].Since.IsZero() {
+				t.Fatalf("missing lock wait: %+v", status)
+			}
+			status = m.Status()
+			if len(status.Waiters) != 0 || !status.Held {
+				t.Fatalf("an acquired lock must not be reported as blocked: %+v", status)
+			}
+		})
+	}
+}
+
+func (f *fakeAdminLocker) ReleaseLock() {
+	if f.releaseDelay > 0 {
+		time.Sleep(f.releaseDelay)
+	}
+	f.mu.Lock()
+	f.releases = append(f.releases, time.Now())
+	f.mu.Unlock()
+}
+
+func (f *fakeAdminLocker) SetMessage(message string) {}
+
+func (f *fakeAdminLocker) counts() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests), len(f.releases)
+}
+
+func newTestLockManager(locker adminLocker, yieldWindow, fairnessWindow time.Duration) *AdminLockManager {
+	m := &AdminLockManager{
+		locker:         locker,
+		clientName:     "test",
+		yieldWindow:    yieldWindow,
+		fairnessWindow: fairnessWindow,
+	}
+	m.cond = sync.NewCond(&m.mu)
+	return m
+}
+
+func TestAdminLockManagerRefCountsOverlappingHolds(t *testing.T) {
+	t.Parallel()
+
+	locker := &fakeAdminLocker{}
+	m := newTestLockManager(locker, defaultAdminLockYieldWindow, DefaultAdminLockFairnessWindow)
+
+	release1, _ := m.Acquire("a")
+	release2, _ := m.Acquire("b")
+
+	if requests, releases := locker.counts(); requests != 1 || releases != 0 {
+		t.Fatalf("expected one lease request while overlapping, got requests=%d releases=%d", requests, releases)
+	}
+
+	release1()
+	if _, releases := locker.counts(); releases != 0 {
+		t.Fatalf("lock released while still held by another caller")
+	}
+	release2()
+	if _, releases := locker.counts(); releases != 1 {
+		t.Fatalf("expected one release after last holder, got %d", releases)
+	}
+}
+
+func TestAdminLockManagerYieldsBeforeReacquire(t *testing.T) {
+	t.Parallel()
+
+	locker := &fakeAdminLocker{}
+	m := newTestLockManager(locker, 100*time.Millisecond, DefaultAdminLockFairnessWindow)
+
+	release, _ := m.Acquire("first")
+	release()
+	release, _ = m.Acquire("second")
+	release()
+
+	locker.mu.Lock()
+	gap := locker.requests[1].Sub(locker.releases[0])
+	locker.mu.Unlock()
+	if gap < 90*time.Millisecond {
+		t.Fatalf("re-acquire did not yield to competing clients: gap=%v", gap)
+	}
+}
+
+func TestAdminLockManagerFairnessWindowForcesFullRelease(t *testing.T) {
+	t.Parallel()
+
+	locker := &fakeAdminLocker{}
+	m := newTestLockManager(locker, 20*time.Millisecond, 50*time.Millisecond)
+
+	release1, _ := m.Acquire("long-hold")
+	releaseFirst := sync.OnceFunc(release1)
+	defer releaseFirst()
+	m.mu.Lock()
+	m.heldSince = time.Now().Add(-time.Second)
+	m.mu.Unlock()
+
+	acquired := make(chan func(), 1)
+	go func() {
+		release2, _ := m.Acquire("late-joiner")
+		acquired <- release2
+	}()
+
+	require.Eventually(t, func() bool { return len(m.Status().Waiters) == 1 }, time.Second, time.Millisecond)
+	select {
+	case <-acquired:
+		t.Fatalf("late acquire joined a hold older than the fairness window")
+	default:
+	}
+
+	status := m.Status()
+	if status.Message != "long-hold" {
+		t.Errorf("waiter replaced the current holder's message: %q", status.Message)
+	}
+	if len(status.Waiters) != 1 || status.Waiters[0].Reason != "late-joiner" {
+		t.Errorf("missing fairness waiter: %+v", status.Waiters)
+	}
+	releaseFirst()
+
+	select {
+	case release2 := <-acquired:
+		release2()
+	case <-time.After(time.Second):
+		t.Fatalf("late acquire did not proceed after full release")
+	}
+
+	if requests, releases := locker.counts(); requests != 2 || releases != 2 {
+		t.Fatalf("expected a full release/re-acquire cycle, got requests=%d releases=%d", requests, releases)
+	}
+}
+
+func TestAdminLockManagerAcquireWaitsForReleaseInFlight(t *testing.T) {
+	t.Parallel()
+
+	locker := &fakeAdminLocker{releaseDelay: 50 * time.Millisecond}
+	m := newTestLockManager(locker, time.Millisecond, DefaultAdminLockFairnessWindow)
+
+	release1, _ := m.Acquire("first")
+	releaseDone := make(chan struct{})
+	go func() {
+		release1()
+		close(releaseDone)
+	}()
+	// Let the release enter the slow ReleaseLock before re-acquiring.
+	time.Sleep(10 * time.Millisecond)
+	release2, _ := m.Acquire("second")
+	<-releaseDone
+	release2()
+
+	locker.mu.Lock()
+	defer locker.mu.Unlock()
+	if len(locker.requests) != 2 || len(locker.releases) != 2 {
+		t.Fatalf("unexpected lease traffic: requests=%d releases=%d", len(locker.requests), len(locker.releases))
+	}
+	if locker.requests[1].Before(locker.releases[0]) {
+		t.Fatalf("RequestLock ran while ReleaseLock was still in flight")
+	}
+}
+
+func TestAdminLockManagerZeroFairnessWindowKeepsJoining(t *testing.T) {
+	t.Parallel()
+
+	locker := &fakeAdminLocker{}
+	m := newTestLockManager(locker, time.Millisecond, 0)
+
+	release1, _ := m.Acquire("long-job")
+	m.mu.Lock()
+	m.heldSince = time.Now().Add(-time.Hour)
+	m.mu.Unlock()
+
+	acquired := make(chan func(), 1)
+	go func() {
+		release2, _ := m.Acquire("late-joiner")
+		acquired <- release2
+	}()
+
+	select {
+	case release2 := <-acquired:
+		release2()
+	case <-time.After(time.Second):
+		t.Fatalf("late acquire waited for a full release with the fairness window disabled")
+	}
+	release1()
+
+	if requests, releases := locker.counts(); requests != 1 || releases != 1 {
+		t.Fatalf("expected one shared hold, got requests=%d releases=%d", requests, releases)
+	}
+}
+
+func TestAdminLockManagerSetFairnessWindowWakesWaiters(t *testing.T) {
+	t.Parallel()
+
+	locker := &fakeAdminLocker{}
+	m := newTestLockManager(locker, time.Millisecond, time.Millisecond)
+
+	release1, _ := m.Acquire("long-job")
+	m.mu.Lock()
+	m.heldSince = time.Now().Add(-time.Second)
+	m.mu.Unlock()
+
+	acquired := make(chan func(), 1)
+	go func() {
+		release2, _ := m.Acquire("late-joiner")
+		acquired <- release2
+	}()
+
+	require.Eventually(t, func() bool { return len(m.Status().Waiters) == 1 }, time.Second, time.Millisecond)
+	select {
+	case <-acquired:
+		t.Fatalf("late acquire joined a hold older than the fairness window")
+	default:
+	}
+
+	m.SetFairnessWindow(0)
+
+	select {
+	case release2 := <-acquired:
+		release2()
+	case <-time.After(time.Second):
+		t.Fatalf("disabling the fairness window did not admit the waiting acquire")
+	}
+	release1()
+
+	if requests, releases := locker.counts(); requests != 1 || releases != 1 {
+		t.Fatalf("expected one shared hold, got requests=%d releases=%d", requests, releases)
+	}
+}

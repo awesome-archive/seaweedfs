@@ -1,15 +1,21 @@
 package command
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net/http"
 	"os"
 	"path"
 	"strings"
 
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -17,18 +23,20 @@ var (
 )
 
 type DownloadOptions struct {
-	server *string
+	master *string
+	server *string // deprecated, for backward compatibility
 	dir    *string
 }
 
 func init() {
 	cmdDownload.Run = runDownload // break init cycle
-	d.server = cmdDownload.Flag.String("server", "localhost:9333", "SeaweedFS master location")
+	d.master = cmdDownload.Flag.String("master", "localhost:9333", "SeaweedFS master location")
+	d.server = cmdDownload.Flag.String("server", "", "SeaweedFS master location (deprecated, use -master instead)")
 	d.dir = cmdDownload.Flag.String("dir", ".", "Download the whole folder recursively if specified.")
 }
 
 var cmdDownload = &Command{
-	UsageLine: "download -server=localhost:9333 -dir=one_directory fid1 [fid2 fid3 ...]",
+	UsageLine: "download -master=localhost:9333 -dir=one_directory fid1 [fid2 fid3 ...]",
 	Short:     "download files by file id",
 	Long: `download files by file id.
 
@@ -42,24 +50,34 @@ var cmdDownload = &Command{
 }
 
 func runDownload(cmd *Command, args []string) bool {
+	util.LoadSecurityConfiguration()
+	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
+
+	// Backward compatibility: if -server is provided, use it
+	masterServer := *d.master
+	if *d.server != "" {
+		masterServer = *d.server
+	}
+
+	*d.dir = util.ResolvePath(*d.dir)
 	for _, fid := range args {
-		if e := downloadToFile(*d.server, fid, *d.dir); e != nil {
+		if e := downloadToFile(func(_ context.Context) pb.ServerAddress { return pb.ServerAddress(masterServer) }, grpcDialOption, fid, *d.dir); e != nil {
 			fmt.Println("Download Error: ", fid, e)
 		}
 	}
 	return true
 }
 
-func downloadToFile(server, fileId, saveDir string) error {
-	fileUrl, lookupError := operation.LookupFileId(server, fileId)
+func downloadToFile(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, fileId, saveDir string) error {
+	fileUrl, jwt, lookupError := operation.LookupFileId(masterFn, grpcDialOption, fileId)
 	if lookupError != nil {
 		return lookupError
 	}
-	filename, _, rc, err := util.DownloadFile(fileUrl)
+	filename, _, rc, err := util_http.DownloadFile(fileUrl, jwt)
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer util_http.CloseResponse(rc)
 	if filename == "" {
 		filename = fileId
 	}
@@ -75,14 +93,14 @@ func downloadToFile(server, fileId, saveDir string) error {
 	}
 	defer f.Close()
 	if isFileList {
-		content, err := ioutil.ReadAll(rc)
+		content, err := io.ReadAll(rc.Body)
 		if err != nil {
 			return err
 		}
 		fids := strings.Split(string(content), "\n")
 		for _, partId := range fids {
 			var n int
-			_, part, err := fetchContent(*d.server, partId)
+			_, part, err := fetchContent(masterFn, grpcDialOption, partId)
 			if err == nil {
 				n, err = f.Write(part)
 			}
@@ -94,7 +112,7 @@ func downloadToFile(server, fileId, saveDir string) error {
 			}
 		}
 	} else {
-		if _, err = io.Copy(f, rc); err != nil {
+		if _, err = io.Copy(f, rc.Body); err != nil {
 			return err
 		}
 
@@ -102,29 +120,16 @@ func downloadToFile(server, fileId, saveDir string) error {
 	return nil
 }
 
-func fetchContent(server string, fileId string) (filename string, content []byte, e error) {
-	fileUrl, lookupError := operation.LookupFileId(server, fileId)
+func fetchContent(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, fileId string) (filename string, content []byte, e error) {
+	fileUrl, jwt, lookupError := operation.LookupFileId(masterFn, grpcDialOption, fileId)
 	if lookupError != nil {
 		return "", nil, lookupError
 	}
-	var rc io.ReadCloser
-	if filename, _, rc, e = util.DownloadFile(fileUrl); e != nil {
+	var rc *http.Response
+	if filename, _, rc, e = util_http.DownloadFile(fileUrl, jwt); e != nil {
 		return "", nil, e
 	}
-	content, e = ioutil.ReadAll(rc)
-	rc.Close()
+	defer util_http.CloseResponse(rc)
+	content, e = io.ReadAll(rc.Body)
 	return
-}
-
-func WriteFile(filename string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	n, err := f.Write(data)
-	f.Close()
-	if err == nil && n < len(data) {
-		err = io.ErrShortWrite
-	}
-	return err
 }

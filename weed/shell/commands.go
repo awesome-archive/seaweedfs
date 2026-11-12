@@ -3,109 +3,233 @@ package shell
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
-	"google.golang.org/grpc"
 	"io"
-	"net/url"
-	"path/filepath"
-	"strconv"
+	"math/rand/v2"
+	"os"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
+
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient/exclusive_locks"
 )
 
 type ShellOptions struct {
 	Masters        *string
 	GrpcDialOption grpc.DialOption
 	// shell transient context
-	FilerHost string
-	FilerPort int64
-	Directory string
+	FilerHost      string
+	FilerPort      int64
+	FilerGroup     *string
+	FilerAddress   pb.ServerAddress
+	Directory      string
+	Debug          bool
+	ConnectTimeout time.Duration
 }
 
-type commandEnv struct {
+type CommandEnv struct {
 	env          map[string]string
-	masterClient *wdclient.MasterClient
-	option       ShellOptions
+	MasterClient *wdclient.MasterClient
+	option       *ShellOptions
+	locker       *exclusive_locks.ExclusiveLocker
+	noLock       bool
+	forceNoLock  bool
+	verbose      bool
+	filerMu      sync.Mutex
 }
 
-type command interface {
-	Name() string
-	Help() string
-	Do([]string, *commandEnv, io.Writer) error
+func NewCommandEnv(options *ShellOptions) *CommandEnv {
+	ce := &CommandEnv{
+		env:          make(map[string]string),
+		MasterClient: wdclient.NewMasterClient(options.GrpcDialOption, *options.FilerGroup, pb.AdminShellClient, "", "", "", *pb.ServerAddresses(*options.Masters).ToServiceDiscovery()),
+		option:       options,
+		noLock:       false,
+	}
+	ce.locker = exclusive_locks.NewExclusiveLocker(ce.MasterClient, cluster.AdminShellLockName)
+	return ce
 }
 
-var (
-	commands = []command{}
-)
-
-func (ce *commandEnv) parseUrl(input string) (filerServer string, filerPort int64, path string, err error) {
+func (ce *CommandEnv) parseUrl(input string) (path string, err error) {
 	if strings.HasPrefix(input, "http") {
-		return parseFilerUrl(input)
+		err = fmt.Errorf("http://<filer>:<port> prefix is not supported any more")
+		return
 	}
 	if !strings.HasPrefix(input, "/") {
-		input = filepath.ToSlash(filepath.Join(ce.option.Directory, input))
+		input = util.Join(ce.option.Directory, input)
 	}
-	return ce.option.FilerHost, ce.option.FilerPort, input, err
+	return input, err
 }
 
-func (ce *commandEnv) isDirectory(ctx context.Context, filerServer string, filerPort int64, path string) bool {
+func (ce *CommandEnv) isDirectory(path string) bool {
 
-	return ce.checkDirectory(ctx, filerServer, filerPort, path) == nil
+	return ce.checkDirectory(path) == nil
 
 }
 
-func (ce *commandEnv) checkDirectory(ctx context.Context, filerServer string, filerPort int64, path string) error {
+func (ce *CommandEnv) confirmIsLocked(args []string) error {
 
-	dir, name := filer2.FullPath(path).DirAndName()
-
-	return ce.withFilerClient(ctx, filerServer, filerPort, func(client filer_pb.SeaweedFilerClient) error {
-
-		resp, listErr := client.ListEntries(ctx, &filer_pb.ListEntriesRequest{
-			Directory:          dir,
-			Prefix:             name,
-			StartFromFileName:  name,
-			InclusiveStartFrom: true,
-			Limit:              1,
-		})
-		if listErr != nil {
-			return listErr
-		}
-
-		if len(resp.Entries) == 0 {
-			return fmt.Errorf("entry not found")
-		}
-
-		if resp.Entries[0].Name != name {
-			return fmt.Errorf("not a valid directory, found %s", resp.Entries[0].Name)
-		}
-
-		if !resp.Entries[0].IsDirectory {
-			return fmt.Errorf("not a directory")
-		}
-
+	if ce.noLock || ce.forceNoLock {
 		return nil
-	})
+	}
+	if ce.locker.IsLocked() {
+		return nil
+	}
+	ce.locker.SetMessage(fmt.Sprintf("%v", args))
+
+	return fmt.Errorf("need to run \"lock\" first to continue")
 
 }
 
-func parseFilerUrl(entryPath string) (filerServer string, filerPort int64, path string, err error) {
-	if strings.HasPrefix(entryPath, "http") {
-		var u *url.URL
-		u, err = url.Parse(entryPath)
-		if err != nil {
-			return
-		}
-		filerServer = u.Hostname()
-		portString := u.Port()
-		if portString != "" {
-			filerPort, err = strconv.ParseInt(portString, 10, 32)
-		}
-		path = u.Path
-	} else {
-		err = fmt.Errorf("path should have full url http://<filer_server>:<port>/path/to/dirOrFile : %s", entryPath)
+func (ce *CommandEnv) SetNoLock(noLock bool) {
+	if ce == nil {
+		return
 	}
+	ce.noLock = noLock
+}
+
+func (ce *CommandEnv) ForceNoLock() {
+	if ce == nil {
+		return
+	}
+	ce.forceNoLock = true
+}
+
+func (ce *CommandEnv) isLocked() bool {
+	if ce == nil {
+		return true
+	}
+	if ce.noLock || ce.forceNoLock {
+		return true
+	}
+	return ce.locker.IsLocked()
+}
+
+// shellLockHolder asks the master who currently holds the cluster-wide shell
+// lock. Best effort: masters without GetAdminLockStatus report no holder, and
+// the lookup is bounded so an unresponsive master cannot hang the shell.
+func (ce *CommandEnv) shellLockHolder() (clientName string, message string, held bool) {
+	attemptCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ce.MasterClient.WithClient(attemptCtx, false, func(client master_pb.SeaweedClient) error {
+		resp, err := client.GetAdminLockStatus(attemptCtx, &master_pb.GetAdminLockStatusRequest{
+			LockName: cluster.AdminShellLockName,
+		})
+		if err == nil && resp.IsLocked {
+			clientName, message, held = resp.ClientName, resp.Message, true
+		}
+		return err
+	})
 	return
+}
+
+func (ce *CommandEnv) checkDirectory(path string) error {
+
+	dir, name := util.FullPath(path).DirAndName()
+
+	exists, err := filer_pb.Exists(context.Background(), ce, dir, name, true)
+
+	if !exists {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+
+	return err
+
+}
+
+var _ = filer_pb.FilerClient(&CommandEnv{})
+
+func (ce *CommandEnv) GrpcDialOption() grpc.DialOption {
+	return ce.option.GrpcDialOption
+}
+
+func (ce *CommandEnv) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+
+	return pb.WithGrpcFilerClient(streamingMode, 0, ce.FilerAddress(), ce.option.GrpcDialOption, fn)
+
+}
+
+// FilerAddress returns the discovered or configured filer, running discovery
+// on first use so commands that never need a filer skip the wait entirely.
+// A failed or empty discovery is not cached: each later call retries until a
+// filer registers, so a long-lived shell can still find one.
+func (ce *CommandEnv) FilerAddress() pb.ServerAddress {
+	ce.filerMu.Lock()
+	defer ce.filerMu.Unlock()
+	ce.discoverFiler()
+	return ce.option.FilerAddress
+}
+
+func (ce *CommandEnv) discoverFiler() {
+	if ce.option.FilerAddress != "" || ce.MasterClient == nil || ce.option.FilerGroup == nil {
+		return
+	}
+	connectTimeout := ce.option.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+	var filers []pb.ServerAddress
+	var listErr error
+	for len(filers) == 0 && ctx.Err() == nil {
+		filers = filers[:0]
+		listErr = ce.MasterClient.WithClient(ctx, false, func(client master_pb.SeaweedClient) error {
+			resp, err := client.ListClusterNodes(ctx, &master_pb.ListClusterNodesRequest{
+				ClientType: cluster.FilerType,
+				FilerGroup: *ce.option.FilerGroup,
+			})
+			if err != nil {
+				return err
+			}
+
+			for _, clusterNode := range resp.ClusterNodes {
+				filers = append(filers, pb.ServerAddress(clusterNode.Address))
+			}
+			return nil
+		})
+		if len(filers) == 0 {
+			if listErr != nil && !util.IsTransientError(listErr) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+		}
+	}
+	if len(filers) > 0 {
+		ce.option.FilerAddress = filers[rand.IntN(len(filers))]
+	} else if listErr != nil {
+		fmt.Fprintf(os.Stderr, "cannot list filers from master %s: %v\n", *ce.option.Masters, listErr)
+	} else {
+		fmt.Fprintf(os.Stderr, "no filer registered with master %s within %s\n", *ce.option.Masters, connectTimeout)
+	}
+	if ce.option.Debug {
+		if len(filers) > 0 {
+			fmt.Fprintf(os.Stderr, "master: %s filers: %v\n", *ce.option.Masters, filers)
+		} else {
+			fmt.Fprintf(os.Stderr, "master: %s\n", *ce.option.Masters)
+		}
+	}
+}
+
+func (ce *CommandEnv) AdjustedUrl(location *filer_pb.Location) string {
+	return location.Url
+}
+
+func (ce *CommandEnv) GetDataCenter() string {
+	return ce.MasterClient.GetDataCenter()
 }
 
 func findInputDirectory(args []string) (input string) {
@@ -117,4 +241,57 @@ func findInputDirectory(args []string) (input string) {
 		}
 	}
 	return input
+}
+
+// isHelpRequest checks if the args contain a help flag (-h, --help, or -help)
+// It also handles combined short flags like -lh or -hl
+func isHelpRequest(args []string) bool {
+	for _, arg := range args {
+		// Check for exact matches
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			return true
+		}
+		// Check for combined short flags (e.g., -lh, -hl, -rfh)
+		// Limit to reasonable length (2-4 chars total) to avoid matching long options like -verbose
+		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && len(arg) > 1 && len(arg) <= 4 {
+			for _, char := range arg[1:] {
+				if char == 'h' {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// handleHelpRequest checks for help flags and prints the help message if requested.
+// It returns true if the help message was printed, indicating the command should exit.
+func handleHelpRequest(c command, args []string, writer io.Writer) bool {
+	if isHelpRequest(args) {
+		fmt.Fprintln(writer, c.Help())
+		return true
+	}
+	return false
+}
+
+func readNeedleStatus(grpcDialOption grpc.DialOption, sourceVolumeServer pb.ServerAddress, volumeId uint32, needleValue needle_map.NeedleValue) (resp *volume_server_pb.VolumeNeedleStatusResponse, err error) {
+	err = operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption,
+		func(client volume_server_pb.VolumeServerClient) error {
+			if resp, err = client.VolumeNeedleStatus(context.Background(), &volume_server_pb.VolumeNeedleStatusRequest{
+				VolumeId: volumeId,
+				NeedleId: uint64(needleValue.Key),
+			}); err != nil {
+				return err
+			}
+			return nil
+		},
+	)
+	return
+}
+
+func getCollectionName(commandEnv *CommandEnv, bucket string) string {
+	if *commandEnv.option.FilerGroup != "" {
+		return fmt.Sprintf("%s_%s", *commandEnv.option.FilerGroup, bucket)
+	}
+	return bucket
 }

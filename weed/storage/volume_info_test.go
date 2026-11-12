@@ -3,7 +3,8 @@ package storage
 import (
 	"testing"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
 func TestSortVolumeInfos(t *testing.T) {
@@ -23,5 +24,19 @@ func TestSortVolumeInfos(t *testing.T) {
 		if vis[i].Id != needle.VolumeId(i+1) {
 			t.Fatal()
 		}
+	}
+}
+
+func TestNewVolumeInfoFromShortKeepsDiskId(t *testing.T) {
+	vi, err := NewVolumeInfoFromShort(&master_pb.VolumeShortInformationMessage{
+		Id:      7,
+		Version: 3,
+		DiskId:  3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vi.DiskId != 3 {
+		t.Fatalf("DiskId = %d, want 3", vi.DiskId)
 	}
 }

@@ -1,52 +1,70 @@
 package erasure_coding
 
+import (
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+)
+
 type Interval struct {
-	blockIndex       int
-	innerBlockOffset int64
-	size             uint32
-	isLargeBlock     bool
+	BlockIndex          int // the index of the block in either the large blocks or the small blocks
+	InnerBlockOffset    int64
+	Size                types.Size
+	IsLargeBlock        bool // whether the block is a large block or a small block
+	LargeBlockRowsCount int
 }
 
-func locateData(largeBlockLength, smallBlockLength int64, datSize int64, offset int64, size uint32) (intervals []Interval) {
-	blockIndex, isLargeBlock, innerBlockOffset := locateOffset(largeBlockLength, smallBlockLength, datSize, offset)
-
-	nLargeBlockRows := int(datSize / (largeBlockLength * DataShardsCount))
+// LocateData finds the intervals of data within erasure coding blocks for a given offset and size.
+func LocateData(largeBlockLength, smallBlockLength int64, shardDatSize int64, offset int64, size types.Size) (intervals []Interval) {
+	blockIndex, isLargeBlock, nLargeBlockRows, innerBlockOffset := locateOffset(largeBlockLength, smallBlockLength, shardDatSize, offset)
 
 	for size > 0 {
-		interval := Interval{
-			blockIndex:       blockIndex,
-			innerBlockOffset: innerBlockOffset,
-			isLargeBlock:     isLargeBlock,
-		}
-
 		blockRemaining := largeBlockLength - innerBlockOffset
 		if !isLargeBlock {
 			blockRemaining = smallBlockLength - innerBlockOffset
 		}
 
+		if blockRemaining <= 0 {
+			// move to next block
+			blockIndex, isLargeBlock = moveToNextBlock(blockIndex, isLargeBlock, nLargeBlockRows)
+			innerBlockOffset = 0
+			continue
+		}
+
+		interval := Interval{
+			BlockIndex:          blockIndex,
+			InnerBlockOffset:    innerBlockOffset,
+			IsLargeBlock:        isLargeBlock,
+			LargeBlockRowsCount: int(nLargeBlockRows),
+		}
+
 		if int64(size) <= blockRemaining {
-			interval.size = size
+			interval.Size = size
 			intervals = append(intervals, interval)
 			return
 		}
-		interval.size = uint32(blockRemaining)
+		interval.Size = types.Size(blockRemaining)
 		intervals = append(intervals, interval)
 
-		size -= interval.size
-		blockIndex += 1
-		if isLargeBlock && blockIndex == nLargeBlockRows*DataShardsCount {
-			isLargeBlock = false
-			blockIndex = 0
-		}
+		size -= interval.Size
+		blockIndex, isLargeBlock = moveToNextBlock(blockIndex, isLargeBlock, nLargeBlockRows)
 		innerBlockOffset = 0
 
 	}
 	return
 }
 
-func locateOffset(largeBlockLength, smallBlockLength int64, datSize int64, offset int64) (blockIndex int, isLargeBlock bool, innerBlockOffset int64) {
+func moveToNextBlock(blockIndex int, isLargeBlock bool, nLargeBlockRows int64) (int, bool) {
+	nextBlockIndex := blockIndex + 1
+	nextIsLargeBlock := isLargeBlock
+	if isLargeBlock && int64(nextBlockIndex) == nLargeBlockRows*DataShardsCount {
+		nextIsLargeBlock = false
+		nextBlockIndex = 0
+	}
+	return nextBlockIndex, nextIsLargeBlock
+}
+
+func locateOffset(largeBlockLength, smallBlockLength int64, shardDatSize int64, offset int64) (blockIndex int, isLargeBlock bool, nLargeBlockRows int64, innerBlockOffset int64) {
 	largeRowSize := largeBlockLength * DataShardsCount
-	nLargeBlockRows := datSize / (largeBlockLength * DataShardsCount)
+	nLargeBlockRows = shardDatSize / largeBlockLength
 
 	// if offset is within the large block area
 	if offset < nLargeBlockRows*largeRowSize {
@@ -65,4 +83,16 @@ func locateOffsetWithinBlocks(blockLength int64, offset int64) (blockIndex int, 
 	blockIndex = int(offset / blockLength)
 	innerBlockOffset = offset % blockLength
 	return
+}
+
+func (interval Interval) ToShardIdAndOffset(largeBlockSize, smallBlockSize int64) (ShardId, int64) {
+	ecFileOffset := interval.InnerBlockOffset
+	rowIndex := interval.BlockIndex / DataShardsCount
+	if interval.IsLargeBlock {
+		ecFileOffset += int64(rowIndex) * largeBlockSize
+	} else {
+		ecFileOffset += int64(interval.LargeBlockRowsCount)*largeBlockSize + int64(rowIndex)*smallBlockSize
+	}
+	ecFileIndex := interval.BlockIndex % DataShardsCount
+	return ShardId(ecFileIndex), ecFileOffset
 }

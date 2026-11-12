@@ -7,10 +7,11 @@ import (
 	"log"
 	"os"
 
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -19,6 +20,7 @@ var (
 
 func main() {
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
 	dst, err := os.OpenFile(*metaFile, os.O_RDONLY, 0644)
 	if err != nil {
@@ -58,9 +60,9 @@ func walkMetaFile(dst *os.File) error {
 			return err
 		}
 
-		fmt.Fprintf(os.Stdout, "file %s %v\n", filer2.FullPath(fullEntry.Dir).Child(fullEntry.Entry.Name), fullEntry.Entry.Attributes.String())
-		for i, chunk := range fullEntry.Entry.Chunks {
-			fmt.Fprintf(os.Stdout, "  chunk %d %v\n", i+1, chunk.String())
+		fmt.Fprintf(os.Stdout, "file %s %v\n", util.FullPath(fullEntry.Dir).Child(fullEntry.Entry.Name), fullEntry.Entry.Attributes.String())
+		for i, chunk := range fullEntry.Entry.GetChunks() {
+			fmt.Fprintf(os.Stdout, "  chunk: %d %v %d,%x%08x\n", i+1, chunk, chunk.Fid.VolumeId, chunk.Fid.FileKey, chunk.Fid.Cookie)
 		}
 
 	}

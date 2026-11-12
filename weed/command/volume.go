@@ -1,22 +1,33 @@
 package command
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/spf13/viper"
+	"context"
+	"crypto/tls"
 	"net/http"
+	httppprof "net/http/pprof"
 	"os"
-	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/server"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/spf13/viper"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/server/constants"
+	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+	"github.com/seaweedfs/seaweedfs/weed/util/httpdown"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 var (
@@ -24,51 +35,231 @@ var (
 )
 
 type VolumeServerOptions struct {
-	port                  *int
-	publicPort            *int
-	folders               []string
-	folderMaxLimits       []int
-	ip                    *string
-	publicUrl             *string
-	bindIp                *string
-	masters               *string
-	pulseSeconds          *int
-	idleConnectionTimeout *int
-	maxCpu                *int
-	dataCenter            *string
-	rack                  *string
-	whiteList             []string
-	indexType             *string
-	fixJpgOrientation     *bool
-	readRedirect          *bool
-	cpuProfile            *string
-	memProfile            *string
-	compactionMBPerSecond *int
+	port                      *int
+	portGrpc                  *int
+	publicPort                *int
+	folders                   []string
+	folderMaxLimits           []int32
+	idxFolder                 *string
+	ip                        *string
+	id                        *string
+	publicUrl                 *string
+	bindIp                    *string
+	listenOnLocalhost         *bool
+	mastersString             *string
+	mserverString             *string // deprecated, for backward compatibility
+	masters                   []pb.ServerAddress
+	idleConnectionTimeout     *int
+	dataCenter                *string
+	rack                      *string
+	whiteList                 []string
+	indexType                 *string
+	diskType                  *string
+	tags                      *string
+	fixJpgOrientation         *bool
+	readMode                  *string
+	cpuProfile                *string
+	memProfile                *string
+	compactionMBPerSecond     *int
+	maintenanceMBPerSecond    *int
+	maxParallelVacuumCommits  *int
+	fileSizeLimitMB           *int
+	concurrentUploadLimitMB   *int
+	concurrentDownloadLimitMB *int
+	pprof                     *bool
+	preStopSeconds            *int
+	metricsHttpPort           *int
+	metricsHttpIp             *string
+	// pulseSeconds          *int
+	inflightUploadDataTimeout     *time.Duration
+	inflightDownloadDataTimeout   *time.Duration
+	hasSlowRead                   *bool
+	readBufferSizeMB              *int
+	ldbTimeout                    *int64
+	allowUntrustedRemoteEndpoints *bool
+	fsyncMinBatchBytes            *int64
+	fsyncMinBatchRequests         *int
+	fsyncBatchWait                *time.Duration
+	debug                         *bool
+	debugPort                     *int
+	diskIOProbe                   *bool
+	diskIOTimeout                 *time.Duration
+	diskIOInterval                *time.Duration
+	diskHDDIOSlowLatency          *time.Duration
+	diskSSDIOSlowLatency          *time.Duration
+	diskNVMEIOSlowLatency         *time.Duration
+	diskIOWindow                  *time.Duration
+	diskIOMinSamples              *int
+	diskIOSlowPercent             *float64
+	diskIOErrorPercent            *float64
+	diskIOMaxStatFailures         *int
+	diskRecoveryCoef              *float64
+	// shutdownCtx, when non-nil, tells startVolumeServer to shut down once the
+	// ctx is cancelled. Used by integration tests and by weed mini; nil for
+	// standalone weed volume.
+	shutdownCtx context.Context
+}
+
+func (v *VolumeServerOptions) setDiskIOProbeDefaults() {
+	if v.diskIOProbe == nil {
+		defaultValue := false
+		v.diskIOProbe = &defaultValue
+	}
+	if v.diskIOTimeout == nil {
+		defaultValue := 2 * time.Second
+		v.diskIOTimeout = &defaultValue
+	}
+	if v.diskIOInterval == nil {
+		defaultValue := 60 * time.Second
+		v.diskIOInterval = &defaultValue
+	}
+	if v.diskHDDIOSlowLatency == nil {
+		defaultValue := 500 * time.Millisecond
+		v.diskHDDIOSlowLatency = &defaultValue
+	}
+	if v.diskSSDIOSlowLatency == nil {
+		defaultValue := 100 * time.Millisecond
+		v.diskSSDIOSlowLatency = &defaultValue
+	}
+	if v.diskNVMEIOSlowLatency == nil {
+		defaultValue := 50 * time.Millisecond
+		v.diskNVMEIOSlowLatency = &defaultValue
+	}
+	if v.diskIOWindow == nil {
+		defaultValue := time.Minute
+		v.diskIOWindow = &defaultValue
+	}
+	if v.diskIOMinSamples == nil {
+		defaultValue := 10
+		v.diskIOMinSamples = &defaultValue
+	}
+	if v.diskIOSlowPercent == nil {
+		defaultValue := 20.0
+		v.diskIOSlowPercent = &defaultValue
+	}
+	if v.diskIOErrorPercent == nil {
+		defaultValue := 10.0
+		v.diskIOErrorPercent = &defaultValue
+	}
+	if v.diskIOMaxStatFailures == nil {
+		defaultValue := 5
+		v.diskIOMaxStatFailures = &defaultValue
+	}
+	if v.diskRecoveryCoef == nil {
+		defaultValue := 0.5
+		v.diskRecoveryCoef = &defaultValue
+	}
+}
+
+// syncBatchOption resolves the fsync batch window, defaulting each field so
+// commands or embedders that leave the option pointers unset still start.
+func (v *VolumeServerOptions) syncBatchOption() storage.SyncBatchOption {
+	option := storage.DefaultSyncBatchOption
+	if v.fsyncMinBatchBytes != nil {
+		option.MinBytes = *v.fsyncMinBatchBytes
+	}
+	if v.fsyncMinBatchRequests != nil {
+		option.MinRequests = *v.fsyncMinBatchRequests
+	}
+	if v.fsyncBatchWait != nil {
+		option.Wait = *v.fsyncBatchWait
+	}
+	return option
+}
+
+func (v *VolumeServerOptions) applyDiskIOProbeConfig() {
+	v.setDiskIOProbeDefaults()
+
+	config := util.GetViper()
+
+	if config.IsSet("volume.disk.io.probe") {
+		*v.diskIOProbe = config.GetBool("volume.disk.io.probe")
+	}
+	if config.IsSet("volume.disk.io.timeout") {
+		*v.diskIOTimeout = config.GetDuration("volume.disk.io.timeout")
+	}
+	if config.IsSet("volume.disk.io.slow.latency.hdd") {
+		*v.diskHDDIOSlowLatency = config.GetDuration("volume.disk.io.slow.latency.hdd")
+	}
+	if config.IsSet("volume.disk.io.slow.latency.ssd") {
+		*v.diskSSDIOSlowLatency = config.GetDuration("volume.disk.io.slow.latency.ssd")
+	}
+	if config.IsSet("volume.disk.io.slow.latency.nvme") {
+		*v.diskNVMEIOSlowLatency = config.GetDuration("volume.disk.io.slow.latency.nvme")
+	}
+
+	if config.IsSet("volume.disk.io.interval") {
+		*v.diskIOInterval = config.GetDuration("volume.disk.io.interval")
+	}
+	if config.IsSet("volume.disk.io.window") {
+		*v.diskIOWindow = config.GetDuration("volume.disk.io.window")
+	}
+	if config.IsSet("volume.disk.io.min.samples") {
+		*v.diskIOMinSamples = config.GetInt("volume.disk.io.min.samples")
+	}
+	if config.IsSet("volume.disk.io.slow.percent") {
+		*v.diskIOSlowPercent = config.GetFloat64("volume.disk.io.slow.percent")
+	}
+	if config.IsSet("volume.disk.io.error.percent") {
+		*v.diskIOErrorPercent = config.GetFloat64("volume.disk.io.error.percent")
+	}
+	if config.IsSet("volume.disk.io.max.stat.failures") {
+		*v.diskIOMaxStatFailures = config.GetInt("volume.disk.io.max.stat.failures")
+	}
+	if config.IsSet("volume.disk.io.recovery.coef") {
+		*v.diskRecoveryCoef = config.GetFloat64("volume.disk.io.recovery.coef")
+	}
 }
 
 func init() {
 	cmdVolume.Run = runVolume // break init cycle
 	v.port = cmdVolume.Flag.Int("port", 8080, "http listen port")
+	v.portGrpc = cmdVolume.Flag.Int("port.grpc", 0, "grpc listen port")
 	v.publicPort = cmdVolume.Flag.Int("port.public", 0, "port opened to public")
-	v.ip = cmdVolume.Flag.String("ip", "", "ip or server name")
+	v.ip = cmdVolume.Flag.String("ip", util.DetectedHostAddress(), "ip or server name, also used as identifier")
+	v.id = cmdVolume.Flag.String("id", "", "volume server id. If empty, default to ip:port")
 	v.publicUrl = cmdVolume.Flag.String("publicUrl", "", "Publicly accessible address")
-	v.bindIp = cmdVolume.Flag.String("ip.bind", "0.0.0.0", "ip address to bind to")
-	v.masters = cmdVolume.Flag.String("mserver", "localhost:9333", "comma-separated master servers")
-	v.pulseSeconds = cmdVolume.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats, must be smaller than or equal to the master's setting")
+	v.bindIp = cmdVolume.Flag.String("ip.bind", "", "ip address to bind to. If empty, default to same as -ip option.")
+	v.mastersString = cmdVolume.Flag.String("master", "localhost:9333", "comma-separated master servers")
+	v.mserverString = cmdVolume.Flag.String("mserver", "", "comma-separated master servers (deprecated, use -master instead)")
+	v.preStopSeconds = cmdVolume.Flag.Int("preStopSeconds", 10, "number of seconds between stop send heartbeats and stop volume server")
+	// v.pulseSeconds = cmdVolume.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats, must be smaller than or equal to the master's setting")
 	v.idleConnectionTimeout = cmdVolume.Flag.Int("idleTimeout", 30, "connection idle seconds")
-	v.maxCpu = cmdVolume.Flag.Int("maxCpu", 0, "maximum number of CPUs. 0 means all available CPUs")
 	v.dataCenter = cmdVolume.Flag.String("dataCenter", "", "current volume server's data center name")
 	v.rack = cmdVolume.Flag.String("rack", "", "current volume server's rack name")
 	v.indexType = cmdVolume.Flag.String("index", "memory", "Choose [memory|leveldb|leveldbMedium|leveldbLarge] mode for memory~performance balance.")
+	v.diskType = cmdVolume.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
+	v.tags = cmdVolume.Flag.String("tags", "", "comma-separated tag groups per data dir; each group uses ':' (e.g. fast:ssd,archive)")
 	v.fixJpgOrientation = cmdVolume.Flag.Bool("images.fix.orientation", false, "Adjust jpg orientation when uploading.")
-	v.readRedirect = cmdVolume.Flag.Bool("read.redirect", true, "Redirect moved or non-local volumes.")
+	v.readMode = cmdVolume.Flag.String("readMode", "proxy", "[local|proxy|redirect] how to deal with non-local volume: 'not found|proxy to remote node|redirect volume location'.")
 	v.cpuProfile = cmdVolume.Flag.String("cpuprofile", "", "cpu profile output file")
 	v.memProfile = cmdVolume.Flag.String("memprofile", "", "memory profile output file")
 	v.compactionMBPerSecond = cmdVolume.Flag.Int("compactionMBps", 0, "limit background compaction or copying speed in mega bytes per second")
+	v.maintenanceMBPerSecond = cmdVolume.Flag.Int("maintenanceMBps", 0, "limit maintenance (replication / balance) IO rate in MB/s. Unset is 0, no limitation.")
+	v.maxParallelVacuumCommits = cmdVolume.Flag.Int("compactionMaxParallelCommits", 0, "limit how many vacuum commits run at once on this server; queued commits hold no volume lock. 0 means unlimited")
+	v.fileSizeLimitMB = cmdVolume.Flag.Int("fileSizeLimitMB", 256, "limit file size to avoid out of memory")
+	v.ldbTimeout = cmdVolume.Flag.Int64("index.leveldbTimeout", 0, "alive time for leveldb (default to 0). If leveldb of volume is not accessed in ldbTimeout hours, it will be off loaded to reduce opened files and memory consumption.")
+	v.concurrentUploadLimitMB = cmdVolume.Flag.Int("concurrentUploadLimitMB", 0, "limit total concurrent upload size, 0 means unlimited")
+	v.concurrentDownloadLimitMB = cmdVolume.Flag.Int("concurrentDownloadLimitMB", 0, "limit total concurrent download size, 0 means unlimited")
+	v.pprof = cmdVolume.Flag.Bool("pprof", false, "enable pprof http handlers. precludes -memprofile and -cpuprofile")
+	v.metricsHttpPort = cmdVolume.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
+	v.metricsHttpIp = cmdVolume.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
+	v.idxFolder = cmdVolume.Flag.String("dir.idx", "", "directory to store .idx files")
+	v.inflightUploadDataTimeout = cmdVolume.Flag.Duration("inflightUploadDataTimeout", 60*time.Second, "inflight upload data wait timeout of volume servers")
+	v.inflightDownloadDataTimeout = cmdVolume.Flag.Duration("inflightDownloadDataTimeout", 60*time.Second, "inflight download data wait timeout of volume servers")
+	v.hasSlowRead = cmdVolume.Flag.Bool("hasSlowRead", true, "<experimental> if true, this prevents slow reads from blocking other requests, but large file read P99 latency will increase.")
+	v.readBufferSizeMB = cmdVolume.Flag.Int("readBufferSizeMB", 4, "<experimental> larger values can optimize query performance but will increase some memory usage,Use with hasSlowRead normally.")
+	v.allowUntrustedRemoteEndpoints = cmdVolume.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
+	v.fsyncMinBatchBytes = cmdVolume.Flag.Int64("fsyncMinBatchBytes", 1*1024*1024, "minimum bytes an fsync batch gathers before a drained queue flushes without waiting")
+	v.fsyncMinBatchRequests = cmdVolume.Flag.Int("fsyncMinBatchRequests", 128, "minimum requests an fsync batch gathers before a drained queue flushes without waiting")
+	v.fsyncBatchWait = cmdVolume.Flag.Duration("fsyncBatchWait", 500*time.Microsecond, "how long a below-minimum fsync batch waits for more requests once the queue drains; 0 flushes immediately")
+	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
+	v.debugPort = cmdVolume.Flag.Int("debug.port", 6060, "http port for debugging")
+	v.setDiskIOProbeDefaults()
 }
 
 var cmdVolume = &Command{
-	UsageLine: "volume -port=8080 -dir=/tmp -max=5 -ip=server_name -mserver=localhost:9333",
+	UsageLine: "volume -port=8080 -dir=/tmp -max=5 -ip=server_name -master=localhost:9333",
 	Short:     "start a volume server",
 	Long: `start a volume server to provide storage spaces
 
@@ -77,67 +268,170 @@ var cmdVolume = &Command{
 
 var (
 	volumeFolders         = cmdVolume.Flag.String("dir", os.TempDir(), "directories to store data files. dir[,dir]...")
-	maxVolumeCounts       = cmdVolume.Flag.String("max", "7", "maximum numbers of volumes, count[,count]...")
+	maxVolumeCounts       = cmdVolume.Flag.String("max", "8", "maximum numbers of volumes, count[,count]... If set to zero, the limit will be auto configured as free disk space divided by volume size.")
 	volumeWhiteListOption = cmdVolume.Flag.String("whiteList", "", "comma separated Ip addresses having write permission. No limit if empty.")
+	minFreeSpacePercent   = cmdVolume.Flag.String("minFreeSpacePercent", "1", "minimum free disk space (default to 1%). Low disk space will mark all volumes as ReadOnly (deprecated, use minFreeSpace instead).")
+	minFreeSpace          = cmdVolume.Flag.String("minFreeSpace", "", "min free disk space (value<=100 as percentage like 1, other as human readable bytes, like 10GiB). Low disk space will mark all volumes as ReadOnly.")
 )
 
 func runVolume(cmd *Command, args []string) bool {
-
-	weed_server.LoadConfiguration("security", false)
-
-	if *v.maxCpu < 1 {
-		*v.maxCpu = runtime.NumCPU()
+	if *v.debug {
+		grace.StartDebugServer(*v.debugPort)
 	}
-	runtime.GOMAXPROCS(*v.maxCpu)
-	util.SetupProfiling(*v.cpuProfile, *v.memProfile)
 
-	v.startVolumeServer(*volumeFolders, *maxVolumeCounts, *volumeWhiteListOption)
+	util.LoadSecurityConfiguration()
+	util.LoadConfiguration("volume", false)
+	v.applyDiskIOProbeConfig()
+
+	// If --pprof is set we assume the caller wants to be able to collect
+	// cpu and memory profiles via go tool pprof
+	if !*v.pprof {
+		*v.cpuProfile = util.ResolvePath(*v.cpuProfile)
+		*v.memProfile = util.ResolvePath(*v.memProfile)
+		grace.SetupProfiling(*v.cpuProfile, *v.memProfile)
+	}
+
+	switch {
+	case *v.metricsHttpIp != "":
+		// noting to do, use v.metricsHttpIp
+	case *v.bindIp != "":
+		*v.metricsHttpIp = *v.bindIp
+	case *v.ip != "":
+		*v.metricsHttpIp = *v.ip
+	}
+	go stats_collect.StartMetricsServer(*v.metricsHttpIp, *v.metricsHttpPort)
+
+	// Backward compatibility: if -mserver is provided, use it
+	if *v.mserverString != "" {
+		*v.mastersString = *v.mserverString
+	}
+
+	minFreeSpaces := util.MustParseMinFreeSpace(*minFreeSpace, *minFreeSpacePercent)
+	v.masters = pb.ServerAddresses(*v.mastersString).ToAddresses()
+	v.startVolumeServer(*volumeFolders, *maxVolumeCounts, *volumeWhiteListOption, minFreeSpaces)
 
 	return true
 }
 
-func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, volumeWhiteListOption string) {
+func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, volumeWhiteListOption string, minFreeSpaces []util.MinFreeSpace) {
+	v.setDiskIOProbeDefaults()
 
-	//Set multiple folders and each folder's max volume count limit'
+	// Set multiple folders and each folder's max volume count limit'
 	v.folders = strings.Split(volumeFolders, ",")
+	// Two locations on one directory would load every volume twice, appending to
+	// the same .dat under two independent locks. Compare identity rather than the
+	// path, so a symlink or bind mount aliasing an earlier -dir is caught too.
+	type seenFolder struct {
+		path string
+		info os.FileInfo
+	}
+	var seenFolders []seenFolder
+	for i, folder := range v.folders {
+		v.folders[i] = util.ResolvePath(folder)
+		if err := util.TestFolderWritable(v.folders[i]); err != nil {
+			glog.Fatalf("Check Data Folder(-dir) Writable %s : %s", v.folders[i], err)
+		}
+		folderInfo, err := os.Stat(v.folders[i])
+		if err != nil {
+			glog.Fatalf("Check Data Folder(-dir) %s : %s", v.folders[i], err)
+		}
+		for _, seen := range seenFolders {
+			if os.SameFile(seen.info, folderInfo) {
+				glog.Fatalf("Data Folder(-dir) %s and %s are the same directory", seen.path, v.folders[i])
+			}
+		}
+		seenFolders = append(seenFolders, seenFolder{v.folders[i], folderInfo})
+	}
+
+	// set max
 	maxCountStrings := strings.Split(maxVolumeCounts, ",")
 	for _, maxString := range maxCountStrings {
-		if max, e := strconv.Atoi(maxString); e == nil {
-			v.folderMaxLimits = append(v.folderMaxLimits, max)
+		if max, e := strconv.ParseInt(maxString, 10, 64); e == nil {
+			v.folderMaxLimits = append(v.folderMaxLimits, int32(max))
 		} else {
 			glog.Fatalf("The max specified in -max not a valid number %s", maxString)
+		}
+	}
+	if len(v.folderMaxLimits) == 1 && len(v.folders) > 1 {
+		for i := 0; i < len(v.folders)-1; i++ {
+			v.folderMaxLimits = append(v.folderMaxLimits, v.folderMaxLimits[0])
 		}
 	}
 	if len(v.folders) != len(v.folderMaxLimits) {
 		glog.Fatalf("%d directories by -dir, but only %d max is set by -max", len(v.folders), len(v.folderMaxLimits))
 	}
-	for _, folder := range v.folders {
-		if err := util.TestFolderWritable(folder); err != nil {
-			glog.Fatalf("Check Data Folder(-dir) Writable %s : %s", folder, err)
+
+	if len(minFreeSpaces) == 1 && len(v.folders) > 1 {
+		for i := 0; i < len(v.folders)-1; i++ {
+			minFreeSpaces = append(minFreeSpaces, minFreeSpaces[0])
 		}
 	}
-
-	//security related white list configuration
-	if volumeWhiteListOption != "" {
-		v.whiteList = strings.Split(volumeWhiteListOption, ",")
+	if len(v.folders) != len(minFreeSpaces) {
+		glog.Fatalf("%d directories by -dir, but only %d minFreeSpacePercent is set by -minFreeSpacePercent", len(v.folders), len(minFreeSpaces))
 	}
+
+	// set disk types
+	var diskTypes []types.DiskType
+	diskTypeStrings := strings.Split(*v.diskType, ",")
+	for _, diskTypeString := range diskTypeStrings {
+		diskTypes = append(diskTypes, types.ToDiskType(diskTypeString))
+	}
+	if len(diskTypes) == 1 && len(v.folders) > 1 {
+		for i := 0; i < len(v.folders)-1; i++ {
+			diskTypes = append(diskTypes, diskTypes[0])
+		}
+	}
+	if len(v.folders) != len(diskTypes) {
+		glog.Fatalf("%d directories by -dir, but only %d disk types is set by -disk", len(v.folders), len(diskTypes))
+	}
+
+	var tagsArg string
+	if v.tags != nil {
+		tagsArg = *v.tags
+	}
+	folderTags := parseVolumeTags(tagsArg, len(v.folders))
+
+	// security related white list configuration
+	v.whiteList = util.StringSplit(volumeWhiteListOption, ",")
 
 	if *v.ip == "" {
-		*v.ip = "127.0.0.1"
+		*v.ip = util.DetectedHostAddress()
+		glog.V(0).Infof("detected volume server ip address: %v", *v.ip)
 	}
+	// The loopback companion listener is only kept while -ip.bind is unset
+	// and the bind address falls back to -ip. An explicit -ip.bind pins each
+	// port to exactly that address.
+	listenOnLocalhost := *v.bindIp == ""
+	if v.listenOnLocalhost != nil {
+		listenOnLocalhost = *v.listenOnLocalhost
+	}
+	if *v.bindIp == "" {
+		*v.bindIp = *v.ip
+	}
+	util.SetOutboundLocalIP(*v.bindIp)
 
 	if *v.publicPort == 0 {
 		*v.publicPort = *v.port
 	}
-	if *v.publicUrl == "" {
-		*v.publicUrl = *v.ip + ":" + strconv.Itoa(*v.publicPort)
+	if *v.portGrpc == 0 {
+		*v.portGrpc = 10000 + *v.port
 	}
-	isSeperatedPublicPort := *v.publicPort != *v.port
+	if *v.publicUrl == "" {
+		*v.publicUrl = util.JoinHostPort(*v.ip, *v.publicPort)
+	}
 
 	volumeMux := http.NewServeMux()
 	publicVolumeMux := volumeMux
-	if isSeperatedPublicPort {
+	if v.isSeparatedPublicPort() {
 		publicVolumeMux = http.NewServeMux()
+	}
+
+	if *v.pprof {
+		volumeMux.HandleFunc("/debug/pprof/", httppprof.Index)
+		volumeMux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+		volumeMux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+		volumeMux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+		volumeMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	}
 
 	volumeNeedleMapKind := storage.NeedleMapInMemory
@@ -150,63 +444,303 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		volumeNeedleMapKind = storage.NeedleMapLevelDbLarge
 	}
 
-	masters := *v.masters
+	// Determine volume server ID: if not specified, use ip:port
+	volumeServerId := util.GetVolumeServerId(*v.id, *v.ip, *v.port)
 
+	diskProbeConfig := stats_collect.DiskIOProbeConfig{
+		Enabled:  *v.diskIOProbe,
+		Timeout:  *v.diskIOTimeout,
+		Interval: *v.diskIOInterval,
+
+		SlowLatency: *v.diskHDDIOSlowLatency,
+		SlowLatencyByDiskType: map[string]time.Duration{
+			types.HddType:  *v.diskHDDIOSlowLatency,
+			types.SsdType:  *v.diskSSDIOSlowLatency,
+			types.NvmeType: *v.diskNVMEIOSlowLatency,
+		},
+
+		Window:     *v.diskIOWindow,
+		MinSamples: *v.diskIOMinSamples,
+
+		SlowPercent:  *v.diskIOSlowPercent,
+		ErrorPercent: *v.diskIOErrorPercent,
+
+		MaxStatFailures: *v.diskIOMaxStatFailures,
+
+		RecoveryCoef: *v.diskRecoveryCoef,
+	}
 	volumeServer := weed_server.NewVolumeServer(volumeMux, publicVolumeMux,
-		*v.ip, *v.port, *v.publicUrl,
-		v.folders, v.folderMaxLimits,
+		*v.ip, *v.port, *v.portGrpc, *v.publicUrl, volumeServerId,
+		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes, folderTags,
+		util.ResolvePath(*v.idxFolder),
 		volumeNeedleMapKind,
-		strings.Split(masters, ","), *v.pulseSeconds, *v.dataCenter, *v.rack,
+		v.masters, constants.VolumePulsePeriod, *v.dataCenter, *v.rack,
 		v.whiteList,
-		*v.fixJpgOrientation, *v.readRedirect,
+		*v.fixJpgOrientation, *v.readMode,
 		*v.compactionMBPerSecond,
+		*v.maintenanceMBPerSecond,
+		*v.maxParallelVacuumCommits,
+		*v.fileSizeLimitMB,
+		int64(*v.concurrentUploadLimitMB)*1024*1024,
+		int64(*v.concurrentDownloadLimitMB)*1024*1024,
+		*v.inflightUploadDataTimeout,
+		*v.inflightDownloadDataTimeout,
+		*v.hasSlowRead,
+		*v.readBufferSizeMB,
+		*v.ldbTimeout,
+		*v.allowUntrustedRemoteEndpoints,
+		diskProbeConfig,
+		v.syncBatchOption(),
 	)
+	// starting grpc server
+	grpcS := v.startGrpcService(volumeServer, listenOnLocalhost)
 
-	listeningAddress := *v.bindIp + ":" + strconv.Itoa(*v.port)
-	glog.V(0).Infof("Start Seaweed volume server %s at %s", util.VERSION, listeningAddress)
-	listener, e := util.NewListener(listeningAddress, time.Duration(*v.idleConnectionTimeout)*time.Second)
-	if e != nil {
-		glog.Fatalf("Volume server listener error:%v", e)
-	}
-	if isSeperatedPublicPort {
-		publicListeningAddress := *v.bindIp + ":" + strconv.Itoa(*v.publicPort)
-		glog.V(0).Infoln("Start Seaweed volume server", util.VERSION, "public at", publicListeningAddress)
-		publicListener, e := util.NewListener(publicListeningAddress, time.Duration(*v.idleConnectionTimeout)*time.Second)
-		if e != nil {
-			glog.Fatalf("Volume server listener error:%v", e)
+	// starting public http server
+	var publicHttpDown httpdown.Server
+	if v.isSeparatedPublicPort() {
+		publicHttpDown = v.startPublicHttpService(publicVolumeMux, listenOnLocalhost)
+		if nil == publicHttpDown {
+			glog.Fatalf("start public http service failed")
 		}
-		go func() {
-			if e := http.Serve(publicListener, publicVolumeMux); e != nil {
-				glog.Fatalf("Volume server fail to serve public: %v", e)
-			}
-		}()
 	}
 
-	util.OnInterrupt(func() {
-		volumeServer.Shutdown()
-		pprof.StopCPUProfile()
+	// starting the cluster http server
+	clusterHttpServer, closeCert := v.startClusterHttpService(volumeMux, listenOnLocalhost)
+
+	grace.OnReload(volumeServer.LoadNewVolumes)
+	grace.OnReload(volumeServer.Reload)
+
+	stopChan := make(chan bool)
+	grace.OnInterrupt(func() {
+		glog.Infof("volume server has been killed")
+
+		// Stop heartbeats
+		if !volumeServer.StopHeartbeat() {
+			volumeServer.SetStopping()
+			glog.V(0).Infof("stop send heartbeat and wait %d seconds until shutdown ...", *v.preStopSeconds)
+			time.Sleep(time.Duration(*v.preStopSeconds) * time.Second)
+		}
+
+		shutdown(publicHttpDown, clusterHttpServer, grpcS, volumeServer)
+		if closeCert != nil {
+			closeCert()
+		}
+		stopChan <- true
 	})
 
-	// starting grpc server
-	grpcPort := *v.port + 10000
-	grpcL, err := util.NewListener(*v.bindIp+":"+strconv.Itoa(grpcPort), 0)
+	if v.shutdownCtx != nil {
+		select {
+		case <-stopChan:
+		case <-v.shutdownCtx.Done():
+			shutdown(publicHttpDown, clusterHttpServer, grpcS, volumeServer)
+			if closeCert != nil {
+				closeCert()
+			}
+		}
+	} else {
+		select {
+		case <-stopChan:
+		}
+	}
+
+}
+
+func parseVolumeTags(tagsArg string, folderCount int) [][]string {
+	if folderCount <= 0 {
+		return nil
+	}
+	tagEntries := []string{}
+	if strings.TrimSpace(tagsArg) != "" {
+		tagEntries = strings.Split(tagsArg, ",")
+	}
+	folderTags := make([][]string, folderCount)
+
+	// If exactly one tag entry provided, replicate it to all folders
+	if len(tagEntries) == 1 {
+		normalized := util.NormalizeTagList(strings.Split(tagEntries[0], ":"))
+		for i := 0; i < folderCount; i++ {
+			folderTags[i] = append([]string(nil), normalized...)
+		}
+	} else {
+		// Otherwise, assign tags to folders that have explicit entries
+		for i := 0; i < folderCount; i++ {
+			if i < len(tagEntries) {
+				folderTags[i] = util.NormalizeTagList(strings.Split(tagEntries[i], ":"))
+			} else {
+				// Initialize remaining folders with empty tag slice
+				folderTags[i] = []string{}
+			}
+		}
+	}
+	return folderTags
+}
+
+func shutdown(publicHttpDown httpdown.Server, clusterHttpServer httpdown.Server, grpcS *grpc.Server, volumeServer *weed_server.VolumeServer) {
+
+	// firstly, stop the public http service to prevent from receiving new user request
+	if nil != publicHttpDown {
+		glog.V(0).Infof("stop public http server ... ")
+		if err := publicHttpDown.Stop(); err != nil {
+			glog.Warningf("stop the public http server failed, %v", err)
+		}
+	}
+
+	glog.V(0).Infof("graceful stop cluster http server ... ")
+	if err := clusterHttpServer.Stop(); err != nil {
+		glog.Warningf("stop the cluster http server failed, %v", err)
+	}
+
+	glog.V(0).Infof("graceful stop gRPC ...")
+	grpcS.GracefulStop()
+
+	volumeServer.Shutdown()
+
+	pprof.StopCPUProfile()
+
+}
+
+// check whether configure the public port
+func (v VolumeServerOptions) isSeparatedPublicPort() bool {
+	return *v.publicPort != *v.port
+}
+
+// multiHttpdownServer gracefully stops an http server serving on both the
+// bound ip and the localhost listeners as if it were a single server.
+type multiHttpdownServer []httpdown.Server
+
+// Wait returns the first member's non-nil error as soon as it happens, so a
+// failing localhost listener is reported even while the bound-ip listener
+// keeps serving, and nil once every member has finished cleanly.
+func (m multiHttpdownServer) Wait() error {
+	errs := make(chan error, len(m))
+	for _, s := range m {
+		go func(s httpdown.Server) { errs <- s.Wait() }(s)
+	}
+	for range m {
+		if err := <-errs; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Stop stops all members concurrently so the localhost listener closes as
+// soon as shutdown begins instead of after the bound-ip listener drains.
+func (m multiHttpdownServer) Stop() error {
+	errs := make(chan error, len(m))
+	for _, s := range m {
+		go func(s httpdown.Server) { errs <- s.Stop() }(s)
+	}
+	var firstErr error
+	for range m {
+		if err := <-errs; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (v VolumeServerOptions) startGrpcService(vs volume_server_pb.VolumeServerServer, listenOnLocalhost bool) *grpc.Server {
+	grpcPort := *v.portGrpc
+	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*v.bindIp, grpcPort, 0, listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("failed to listen on grpc port %d: %v", grpcPort, err)
 	}
-	grpcS := util.NewGrpcServer(security.LoadServerTLS(viper.Sub("grpc"), "volume"))
-	volume_server_pb.RegisterVolumeServerServer(grpcS, volumeServer)
+	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.volume"))
+	volume_server_pb.RegisterVolumeServerServer(grpcS, vs)
 	reflection.Register(grpcS)
-	go grpcS.Serve(grpcL)
-
-	if viper.GetString("https.volume.key") != "" {
-		if e := http.ServeTLS(listener, volumeMux,
-			viper.GetString("https.volume.cert"), viper.GetString("https.volume.key")); e != nil {
-			glog.Fatalf("Volume server fail to serve: %v", e)
+	if grpcLocalL != nil {
+		go grpcS.Serve(grpcLocalL)
+	}
+	go func() {
+		if err := grpcS.Serve(grpcL); err != nil {
+			glog.Fatalf("start gRPC service failed, %s", err)
 		}
-	} else {
-		if e := http.Serve(listener, volumeMux); e != nil {
-			glog.Fatalf("Volume server fail to serve: %v", e)
+	}()
+	pb.ServeGrpcOnLocalSocket(grpcS, grpcPort)
+	return grpcS
+}
+
+func (v VolumeServerOptions) startPublicHttpService(handler http.Handler, listenOnLocalhost bool) httpdown.Server {
+	publicListeningAddress := util.JoinHostPort(*v.bindIp, *v.publicPort)
+	glog.V(0).Infoln("Start Seaweed volume server", version.Version(), "public at", publicListeningAddress)
+	publicListener, publicLocalListener, e := util.NewIpAndLocalListeners(*v.bindIp, *v.publicPort, idleTimeoutSeconds(v.idleConnectionTimeout), listenOnLocalhost)
+	if e != nil {
+		glog.Fatalf("Volume server listener error:%v", e)
+	}
+
+	pubHttp := httpdown.HTTP{StopTimeout: 5 * time.Minute, KillTimeout: 5 * time.Minute}
+	publicHttpDown := multiHttpdownServer{pubHttp.Serve(&http.Server{Handler: handler}, publicListener)}
+	if publicLocalListener != nil {
+		publicHttpDown = append(publicHttpDown, pubHttp.Serve(&http.Server{Handler: handler}, publicLocalListener))
+	}
+	go func() {
+		if err := publicHttpDown.Wait(); err != nil {
+			glog.Errorf("public http down wait failed, %v", err)
+		}
+	}()
+
+	return publicHttpDown
+}
+
+// startClusterHttpService starts the volume cluster HTTP server and
+// returns it along with a close func for the cert reloader's refresh
+// goroutine (nil when HTTPS is disabled). The caller is responsible
+// for invoking the close func on every shutdown path — both the
+// SIGTERM/grace.OnInterrupt path and the shutdownCtx path used by
+// mini/integration tests.
+func (v VolumeServerOptions) startClusterHttpService(handler http.Handler, listenOnLocalhost bool) (httpdown.Server, func()) {
+	var (
+		certFile, keyFile string
+	)
+	if viper.GetString("https.volume.key") != "" {
+		certFile = viper.GetString("https.volume.cert")
+		keyFile = viper.GetString("https.volume.key")
+	}
+
+	listeningAddress := util.JoinHostPort(*v.bindIp, *v.port)
+	glog.V(0).Infof("Start Seaweed volume server %s at %s", version.Version(), listeningAddress)
+	listener, localListener, e := util.NewIpAndLocalListeners(*v.bindIp, *v.port, idleTimeoutSeconds(v.idleConnectionTimeout), listenOnLocalhost)
+	if e != nil {
+		glog.Fatalf("Volume server listener error:%v", e)
+	}
+
+	httpDown := httpdown.HTTP{
+		KillTimeout: time.Minute,
+		StopTimeout: 30 * time.Second,
+	}
+	httpS := &http.Server{Handler: handler}
+
+	if viper.GetString("https.volume.ca") != "" {
+		clientCertFile := viper.GetString("https.volume.ca")
+		httpS.TLSConfig = security.LoadClientTLSHTTP(clientCertFile)
+		if err := security.FixTlsConfig(util.GetViper(), httpS.TLSConfig); err != nil {
+			glog.Fatalf("Could not fix TLS config: %v", err)
 		}
 	}
 
+	var closeCert func()
+	if certFile != "" && keyFile != "" {
+		getCert, certProvider, err := security.NewReloadingServerCertificate(certFile, keyFile)
+		if err != nil {
+			glog.Fatalf("Volume server failed to load TLS certificate: %v", err)
+		}
+		closeCert = certProvider.Close
+		if httpS.TLSConfig == nil {
+			httpS.TLSConfig = &tls.Config{}
+		}
+		httpS.TLSConfig.GetCertificate = getCert
+	}
+
+	clusterHttpServers := multiHttpdownServer{httpDown.Serve(httpS, listener)}
+	if localListener != nil {
+		localHttpS := &http.Server{Handler: handler, TLSConfig: httpS.TLSConfig}
+		clusterHttpServers = append(clusterHttpServers, httpDown.Serve(localHttpS, localListener))
+	}
+	go func() {
+		if e := clusterHttpServers.Wait(); e != nil {
+			glog.Fatalf("Volume server fail to serve: %v", e)
+		}
+	}()
+	return clusterHttpServers, closeCert
 }

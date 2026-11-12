@@ -4,22 +4,27 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"cloud.google.com/go/storage"
-	"github.com/chrislusf/seaweedfs/weed/filer2"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/replication/sink"
-	"github.com/chrislusf/seaweedfs/weed/replication/source"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
+	"github.com/seaweedfs/seaweedfs/weed/replication/source"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type GcsSink struct {
-	client      *storage.Client
-	bucket      string
-	dir         string
-	filerSource *source.FilerSource
+	client        *storage.Client
+	bucket        string
+	dir           string
+	filerSource   *source.FilerSource
+	isIncremental bool
 }
 
 func init() {
@@ -34,11 +39,20 @@ func (g *GcsSink) GetSinkToDirectory() string {
 	return g.dir
 }
 
-func (g *GcsSink) Initialize(configuration util.Configuration) error {
+func (g *GcsSink) GetDestinationIdentity() string {
+	return g.bucket + "\x00" + g.dir
+}
+
+func (g *GcsSink) IsIncremental() bool {
+	return g.isIncremental
+}
+
+func (g *GcsSink) Initialize(configuration util.Configuration, prefix string) error {
+	g.isIncremental = configuration.GetBool(prefix + "is_incremental")
 	return g.initialize(
-		configuration.GetString("google_application_credentials"),
-		configuration.GetString("bucket"),
-		configuration.GetString("directory"),
+		configuration.GetString(prefix+"google_application_credentials"),
+		configuration.GetString(prefix+"bucket"),
+		configuration.GetString(prefix+"directory"),
 	)
 }
 
@@ -50,18 +64,31 @@ func (g *GcsSink) initialize(google_application_credentials, bucketName, dir str
 	g.bucket = bucketName
 	g.dir = dir
 
-	ctx := context.Background()
 	// Creates a client.
-	if google_application_credentials == "" {
-		var found bool
-		google_application_credentials, found = os.LookupEnv("GOOGLE_APPLICATION_CREDENTIALS")
-		if !found {
-			glog.Fatalf("need to specific GOOGLE_APPLICATION_CREDENTIALS env variable or google_application_credentials in replication.toml")
+	var clientOpts []option.ClientOption
+	if google_application_credentials != "" {
+		var data []byte
+		var err error
+		if strings.HasPrefix(google_application_credentials, "{") {
+			data = []byte(google_application_credentials)
+		} else {
+			googleCredentialsPath := util.ResolvePath(google_application_credentials)
+			data, err = os.ReadFile(googleCredentialsPath)
+			if err != nil {
+				return fmt.Errorf("failed to read credentials file %s: %v", googleCredentialsPath, err)
+			}
 		}
+		creds, err := google.CredentialsFromJSON(context.Background(), data, storage.ScopeFullControl)
+		if err != nil {
+			return fmt.Errorf("failed to parse credentials: %v", err)
+		}
+		httpClient := oauth2.NewClient(context.Background(), creds.TokenSource)
+		clientOpts = append(clientOpts, option.WithHTTPClient(httpClient), option.WithoutAuthentication())
 	}
-	client, err := storage.NewClient(ctx, option.WithCredentialsFile(google_application_credentials))
+	client, err := storage.NewClient(context.Background(), clientOpts...)
 	if err != nil {
-		glog.Fatalf("Failed to create client: %v", err)
+		return fmt.Errorf("failed to create client with credentials \"%s\" env \"%s\": %v",
+			google_application_credentials, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), err)
 	}
 
 	g.client = client
@@ -69,57 +96,66 @@ func (g *GcsSink) initialize(google_application_credentials, bucketName, dir str
 	return nil
 }
 
-func (g *GcsSink) DeleteEntry(ctx context.Context, key string, isDirectory, deleteIncludeChunks bool) error {
+func (g *GcsSink) DeleteEntry(key string, isDirectory, deleteIncludeChunks bool, signatures []int32) error {
 
 	if isDirectory {
 		key = key + "/"
 	}
 
-	if err := g.client.Bucket(g.bucket).Object(key).Delete(ctx); err != nil {
-		return fmt.Errorf("gcs delete %s%s: %v", g.bucket, key, err)
+	if err := g.client.Bucket(g.bucket).Object(key).Delete(context.Background()); err != nil {
+		return fmt.Errorf("gcs delete %s/%s: %v", g.bucket, key, err)
 	}
 
 	return nil
 
 }
 
-func (g *GcsSink) CreateEntry(ctx context.Context, key string, entry *filer_pb.Entry) error {
+func (g *GcsSink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int32) error {
 
 	if entry.IsDirectory {
 		return nil
 	}
 
-	totalSize := filer2.TotalSize(entry.Chunks)
-	chunkViews := filer2.ViewFromChunks(entry.Chunks, 0, int(totalSize))
+	totalSize := filer.FileSize(entry)
+	chunkViews, err := filer.ViewFromChunks(context.Background(), g.filerSource.LookupFileId, entry.GetChunks(), 0, int64(totalSize))
+	if err != nil {
+		return fmt.Errorf("resolve chunks of %s: %w", key, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	wc := g.client.Bucket(g.bucket).Object(key).NewWriter(ctx)
 
-	for _, chunk := range chunkViews {
-
-		fileUrl, err := g.filerSource.LookupFileId(ctx, chunk.FileId)
-		if err != nil {
-			return err
-		}
-
-		_, err = util.ReadUrlAsStream(fileUrl, chunk.Offset, int(chunk.Size), func(data []byte) {
-			wc.Write(data)
-		})
-
-		if err != nil {
-			return err
-		}
-
+	writeFunc := func(data []byte) error {
+		_, writeErr := wc.Write(data)
+		return writeErr
 	}
 
-	if err := wc.Close(); err != nil {
-		return err
+	var writeErr error
+	if len(entry.Content) > 0 {
+		content, decErr := repl_util.MaybeDecryptContent(entry.Content, entry)
+		if decErr != nil {
+			writeErr = fmt.Errorf("decrypt inline SSE content: %w", decErr)
+		} else {
+			writeErr = writeFunc(content)
+		}
+	} else {
+		writeErr = repl_util.CopyFromChunkViews(chunkViews, g.filerSource, writeFunc, entry)
 	}
 
-	return nil
+	if writeErr != nil {
+		// Cancel the context to abort the GCS upload without touching
+		// any existing object at this key.
+		cancel()
+		wc.Close()
+		return writeErr
+	}
+
+	return wc.Close()
 
 }
 
-func (g *GcsSink) UpdateEntry(ctx context.Context, key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool) (foundExistingEntry bool, err error) {
-	// TODO improve efficiency
-	return false, nil
+func (g *GcsSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParentPath string, newEntry *filer_pb.Entry, deleteIncludeChunks bool, signatures []int32) (foundExistingEntry bool, err error) {
+	return true, g.CreateEntry(key, newEntry, signatures)
 }

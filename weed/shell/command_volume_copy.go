@@ -2,14 +2,16 @@ package shell
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
 func init() {
-	commands = append(commands, &commandVolumeCopy{})
+	Commands = append(Commands, &commandVolumeCopy{})
 }
 
 type commandVolumeCopy struct {
@@ -22,7 +24,7 @@ func (c *commandVolumeCopy) Name() string {
 func (c *commandVolumeCopy) Help() string {
 	return `copy a volume from one volume server to another volume server
 
-	volume.copy <source volume server host:port> <target volume server host:port> <volume id>
+	volume.copy -source <source volume server host:port> -target <target volume server host:port> -volumeId <volume id>
 
 	This command copies a volume from one volume server to another volume server.
 	Usually you will want to unmount the volume first before copying.
@@ -30,24 +32,35 @@ func (c *commandVolumeCopy) Help() string {
 `
 }
 
-func (c *commandVolumeCopy) Do(args []string, commandEnv *commandEnv, writer io.Writer) (err error) {
+func (c *commandVolumeCopy) HasTag(CommandTag) bool {
+	return false
+}
 
-	if len(args) != 3 {
-		fmt.Fprintf(writer, "received args: %+v\n", args)
-		return fmt.Errorf("need 3 args of <source volume server host:port> <target volume server host:port> <volume id>")
-	}
-	sourceVolumeServer, targetVolumeServer, volumeIdString := args[0], args[1], args[2]
+func (c *commandVolumeCopy) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
-	volumeId, err := needle.NewVolumeId(volumeIdString)
-	if err != nil {
-		return fmt.Errorf("wrong volume id format %s: %v", volumeId, err)
+	volCopyCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
+	volumeIdInt := volCopyCommand.Int("volumeId", 0, "the volume id")
+	sourceNodeStr := volCopyCommand.String("source", "", "the source volume server <host>:<port>")
+	targetNodeStr := volCopyCommand.String("target", "", "the target volume server <host>:<port>")
+	noLock := volCopyCommand.Bool("noLock", false, "do not lock the admin shell at one's own risk")
+	if err = volCopyCommand.Parse(args); err != nil {
+		return nil
 	}
+
+	if *noLock {
+		commandEnv.noLock = true
+	} else if err = commandEnv.confirmIsLocked(args); err != nil {
+		return
+	}
+
+	sourceVolumeServer, targetVolumeServer := pb.ServerAddress(*sourceNodeStr), pb.ServerAddress(*targetNodeStr)
+
+	volumeId := needle.VolumeId(*volumeIdInt)
 
 	if sourceVolumeServer == targetVolumeServer {
 		return fmt.Errorf("source and target volume servers are the same!")
 	}
 
-	ctx := context.Background()
-	_, err = copyVolume(ctx, commandEnv.option.GrpcDialOption, volumeId, sourceVolumeServer, targetVolumeServer)
+	_, err = copyVolume(context.Background(), commandEnv.option.GrpcDialOption, writer, volumeId, sourceVolumeServer, targetVolumeServer, "", 0, true)
 	return
 }

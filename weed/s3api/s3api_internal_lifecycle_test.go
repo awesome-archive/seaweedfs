@@ -1,0 +1,522 @@
+package s3api
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestComputeEntryIdentity_BasicFields(t *testing.T) {
+	entry := &filer_pb.Entry{
+		Attributes: &filer_pb.FuseAttributes{Mtime: 1700000000, MtimeNs: 123, FileSize: 4096},
+		Chunks: []*filer_pb.FileChunk{
+			{FileId: "1,abc"},
+			{FileId: "1,def"},
+		},
+	}
+	id := computeEntryIdentity(entry)
+	want := int64(1700000000)*int64(1e9) + int64(123)
+	if id.MtimeNs != want {
+		t.Fatalf("MtimeNs want %d, got %d", want, id.MtimeNs)
+	}
+	if id.Size != 4096 {
+		t.Fatalf("Size want 4096, got %d", id.Size)
+	}
+	if id.HeadFid != "1,abc" {
+		t.Fatalf("HeadFid want 1,abc, got %s", id.HeadFid)
+	}
+}
+
+func TestComputeEntryIdentity_NilSafeMissingChunks(t *testing.T) {
+	if got := computeEntryIdentity(nil); got != nil {
+		t.Fatalf("nil entry should return nil, got %v", got)
+	}
+	id := computeEntryIdentity(&filer_pb.Entry{})
+	if id == nil {
+		t.Fatalf("entry with nil Attributes should still produce identity")
+	}
+	if id.HeadFid != "" {
+		t.Fatalf("missing chunks should yield empty HeadFid, got %s", id.HeadFid)
+	}
+}
+
+func TestHashExtended_OrderStable(t *testing.T) {
+	a := map[string][]byte{"k1": []byte("v1"), "k2": []byte("v2")}
+	b := map[string][]byte{"k2": []byte("v2"), "k1": []byte("v1")}
+	if !bytes.Equal(s3lifecycle.HashExtended(a), s3lifecycle.HashExtended(b)) {
+		t.Fatalf("hash should be insensitive to map iteration order")
+	}
+}
+
+func TestHashExtended_DelimiterCollisionResistant(t *testing.T) {
+	// Naively concatenated: "k1=v1k2v2" could collide with "k1=v1k" / "2v2".
+	// Length-prefix encoding must keep them apart.
+	a := map[string][]byte{"k1": []byte("v1"), "k2": []byte("v2")}
+	b := map[string][]byte{"k1": []byte("v1k2v2")}
+	if bytes.Equal(s3lifecycle.HashExtended(a), s3lifecycle.HashExtended(b)) {
+		t.Fatalf("delimiter-forged Extended payloads must not collide")
+	}
+}
+
+func TestHashExtended_NilEqualsEmpty(t *testing.T) {
+	if got := s3lifecycle.HashExtended(nil); len(got) != 0 {
+		t.Fatalf("nil should produce zero-length hash, got %d bytes", len(got))
+	}
+	if got := s3lifecycle.HashExtended(map[string][]byte{}); len(got) != 0 {
+		t.Fatalf("empty map should produce zero-length hash, got %d bytes", len(got))
+	}
+}
+
+func TestIdentityMatches_NilWantTreatedAsMatch(t *testing.T) {
+	// Bootstrap callers that don't yet have an identity to CAS against
+	// pass nil expected_identity; the server treats this as "no CAS".
+	live := &s3_lifecycle_pb.EntryIdentity{MtimeNs: 1, Size: 2}
+	if !identityMatches(live, nil) {
+		t.Fatalf("nil want should match")
+	}
+}
+
+func TestIdentityMatches_NilLiveDoesNotMatch(t *testing.T) {
+	if identityMatches(nil, &s3_lifecycle_pb.EntryIdentity{MtimeNs: 1}) {
+		t.Fatalf("nil live should not match a populated want")
+	}
+}
+
+func TestIdentityMatches_AllFieldsCompared(t *testing.T) {
+	base := &s3_lifecycle_pb.EntryIdentity{MtimeNs: 100, Size: 2048, HeadFid: "1,abc", ExtendedHash: []byte{0x01, 0x02}}
+	cases := []struct {
+		name string
+		live *s3_lifecycle_pb.EntryIdentity
+		want bool
+	}{
+		{"identical", &s3_lifecycle_pb.EntryIdentity{MtimeNs: 100, Size: 2048, HeadFid: "1,abc", ExtendedHash: []byte{0x01, 0x02}}, true},
+		{"mtime-drift", &s3_lifecycle_pb.EntryIdentity{MtimeNs: 101, Size: 2048, HeadFid: "1,abc", ExtendedHash: []byte{0x01, 0x02}}, false},
+		{"size-drift", &s3_lifecycle_pb.EntryIdentity{MtimeNs: 100, Size: 2049, HeadFid: "1,abc", ExtendedHash: []byte{0x01, 0x02}}, false},
+		{"fid-drift", &s3_lifecycle_pb.EntryIdentity{MtimeNs: 100, Size: 2048, HeadFid: "1,xyz", ExtendedHash: []byte{0x01, 0x02}}, false},
+		{"extended-drift", &s3_lifecycle_pb.EntryIdentity{MtimeNs: 100, Size: 2048, HeadFid: "1,abc", ExtendedHash: []byte{0x03, 0x04}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := identityMatches(c.live, base); got != c.want {
+				t.Fatalf("want %v, got %v", c.want, got)
+			}
+		})
+	}
+}
+
+func TestLifecycleDelete_RejectsEmptyRequest(t *testing.T) {
+	s := &S3ApiServer{}
+	resp, err := s.LifecycleDelete(s3LocalPeerCtx(), &s3_lifecycle_pb.LifecycleDeleteRequest{})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if resp.Outcome != s3_lifecycle_pb.LifecycleDeleteOutcome_BLOCKED {
+		t.Fatalf("empty request should be BLOCKED, got %v", resp.Outcome)
+	}
+}
+
+func TestLifecycleAbortMPU_RejectsTraversalUploadIDs(t *testing.T) {
+	// "." and ".." pass the no-slash check but resolve to the bucket
+	// root via util.JoinPath; they must be rejected before any rm call.
+	s := &S3ApiServer{}
+	cases := []string{
+		"",
+		".uploads",
+		".uploads/",
+		".uploads/.",
+		".uploads/..",
+		".uploads/u1/extra",
+	}
+	for _, path := range cases {
+		t.Run(path, func(t *testing.T) {
+			resp, err := s.LifecycleDelete(s3LocalPeerCtx(), &s3_lifecycle_pb.LifecycleDeleteRequest{
+				Bucket:     "bk",
+				ObjectPath: path,
+				ActionKind: s3_lifecycle_pb.ActionKind_ABORT_MPU,
+			})
+			if err != nil {
+				t.Fatalf("unexpected gRPC error: %v", err)
+			}
+			if resp.Outcome != s3_lifecycle_pb.LifecycleDeleteOutcome_BLOCKED {
+				t.Fatalf("path %q: outcome=%v reason=%q, want BLOCKED",
+					path, resp.Outcome, resp.Reason)
+			}
+		})
+	}
+}
+
+func TestLifecycleDispatch_AbortMPUAfterFetchIsBlocked(t *testing.T) {
+	// LifecycleDelete routes ABORT_MPU to lifecycleAbortMPU before
+	// getObjectEntry; reaching lifecycleDispatch with ABORT_MPU means
+	// some caller bypassed that route. Defensive BLOCKED so a
+	// regression there can't accidentally rm a real object via the
+	// expiration paths.
+	s := &S3ApiServer{}
+	resp, err := s.lifecycleDispatch(nil, &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket:     "bk",
+		ObjectPath: "k",
+		ActionKind: s3_lifecycle_pb.ActionKind_ABORT_MPU,
+	}, &filer_pb.Entry{Attributes: &filer_pb.FuseAttributes{}})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if resp.Outcome != s3_lifecycle_pb.LifecycleDeleteOutcome_BLOCKED {
+		t.Fatalf("ABORT_MPU at dispatch should be BLOCKED, got %v reason=%q", resp.Outcome, resp.Reason)
+	}
+	if !contains(resp.Reason, "ABORT_MPU dispatched after fetch") {
+		t.Fatalf("reason should name the route bypass, got %q", resp.Reason)
+	}
+}
+
+func TestLifecycleDispatch_UnknownActionKindIsBlocked(t *testing.T) {
+	// An ActionKind value the proto doesn't define yet must produce a
+	// FATAL outcome rather than fall through to a default delete path.
+	s := &S3ApiServer{}
+	const bogus = s3_lifecycle_pb.ActionKind(999)
+	resp, err := s.lifecycleDispatch(nil, &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket:     "bk",
+		ObjectPath: "k",
+		ActionKind: bogus,
+	}, &filer_pb.Entry{Attributes: &filer_pb.FuseAttributes{}})
+	if err != nil {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if resp.Outcome != s3_lifecycle_pb.LifecycleDeleteOutcome_BLOCKED {
+		t.Fatalf("unknown action kind should be BLOCKED, got %v reason=%q", resp.Outcome, resp.Reason)
+	}
+	if !contains(resp.Reason, "unknown action_kind") {
+		t.Fatalf("reason should name the unknown kind, got %q", resp.Reason)
+	}
+}
+
+func TestLifecycleDispatch_NoncurrentRequiresVersionID(t *testing.T) {
+	// Noncurrent / EXPIRED_DELETE_MARKER target a specific version; an
+	// empty version_id is a writer-side bug and must be rejected before
+	// any filer call. This pinning keeps the early-return in place so
+	// a refactor doesn't accidentally let the empty-version_id path
+	// reach deleteSpecificObjectVersion.
+	s := &S3ApiServer{}
+	for _, kind := range []s3_lifecycle_pb.ActionKind{
+		s3_lifecycle_pb.ActionKind_NONCURRENT_DAYS,
+		s3_lifecycle_pb.ActionKind_NEWER_NONCURRENT,
+		s3_lifecycle_pb.ActionKind_EXPIRED_DELETE_MARKER,
+	} {
+		t.Run(kind.String(), func(t *testing.T) {
+			resp, err := s.lifecycleDispatch(nil, &s3_lifecycle_pb.LifecycleDeleteRequest{
+				Bucket:     "bk",
+				ObjectPath: "k",
+				ActionKind: kind,
+				// VersionId intentionally empty
+			}, &filer_pb.Entry{Attributes: &filer_pb.FuseAttributes{}})
+			if err != nil {
+				t.Fatalf("unexpected gRPC error: %v", err)
+			}
+			if resp.Outcome != s3_lifecycle_pb.LifecycleDeleteOutcome_BLOCKED {
+				t.Fatalf("kind %v with empty version_id should be BLOCKED, got %v reason=%q",
+					kind, resp.Outcome, resp.Reason)
+			}
+			if !contains(resp.Reason, "version_id required") {
+				t.Fatalf("reason should name the missing version_id, got %q", resp.Reason)
+			}
+		})
+	}
+}
+
+// contains is a tiny helper so the tests above don't pull in strings
+// just for a substring check.
+func contains(haystack, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEntryUsesMetadataOnlyDelete(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry *filer_pb.Entry
+		want  bool
+	}{
+		{
+			name:  "nil entry",
+			entry: nil,
+			want:  false,
+		},
+		{
+			name:  "nil attributes",
+			entry: &filer_pb.Entry{},
+			want:  false,
+		},
+		{
+			name:  "TtlSec=0 (no per-write stamp)",
+			entry: &filer_pb.Entry{Attributes: &filer_pb.FuseAttributes{TtlSec: 0}},
+			want:  false,
+		},
+		{
+			name:  "TtlSec>0 (PR 9377 stamped a fast-path TTL)",
+			entry: &filer_pb.Entry{Attributes: &filer_pb.FuseAttributes{TtlSec: 86400}},
+			want:  true,
+		},
+		{
+			name:  "TtlSec<0 should not happen but must not flip the path on",
+			entry: &filer_pb.Entry{Attributes: &filer_pb.FuseAttributes{TtlSec: -1}},
+			want:  false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := entryUsesMetadataOnlyDelete(c.entry); got != c.want {
+				t.Fatalf("want %v, got %v", c.want, got)
+			}
+		})
+	}
+}
+
+func TestRecordMetadataOnlyIf_OnlyFiresWhenOn(t *testing.T) {
+	// Counter must increment exactly once per (bucket, hex(rule_hash))
+	// when on=true, and not at all when on=false. Other lifecycle paths
+	// in the same suite share the global counter — use distinct bucket
+	// names per test so series don't bleed.
+	c := stats_collect.S3LifecycleMetadataOnlyCounter
+	bucket := "bk-counter-on"
+	hash := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04}
+	hexHash := "deadbeef01020304"
+
+	before := testutil.ToFloat64(c.WithLabelValues(bucket, hexHash))
+	recordMetadataOnlyIf(true, &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket:   bucket,
+		RuleHash: hash,
+	})
+	if got := testutil.ToFloat64(c.WithLabelValues(bucket, hexHash)); got != before+1 {
+		t.Fatalf("on=true should bump by 1; before=%v after=%v", before, got)
+	}
+
+	beforeOff := testutil.ToFloat64(c.WithLabelValues("bk-counter-off", hexHash))
+	recordMetadataOnlyIf(false, &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket:   "bk-counter-off",
+		RuleHash: hash,
+	})
+	if got := testutil.ToFloat64(c.WithLabelValues("bk-counter-off", hexHash)); got != beforeOff {
+		t.Fatalf("on=false should not bump; before=%v after=%v", beforeOff, got)
+	}
+}
+
+func TestRecordMetadataOnlyIf_NilRequestSafe(t *testing.T) {
+	// A nil req is a defensive no-op; never panic on the prometheus
+	// label call which would otherwise dereference req.Bucket.
+	recordMetadataOnlyIf(true, nil)
+}
+
+func TestRecordMetadataOnlyIf_EmptyRuleHashCollapsesToEmptyLabel(t *testing.T) {
+	// Bootstrap or test paths may not stamp a rule hash; the label
+	// must end up as an empty string rather than panicking on
+	// hex.EncodeToString(nil).
+	c := stats_collect.S3LifecycleMetadataOnlyCounter
+	bucket := "bk-counter-emptyhash"
+	before := testutil.ToFloat64(c.WithLabelValues(bucket, ""))
+	recordMetadataOnlyIf(true, &s3_lifecycle_pb.LifecycleDeleteRequest{Bucket: bucket})
+	if got := testutil.ToFloat64(c.WithLabelValues(bucket, "")); got != before+1 {
+		t.Fatalf("nil rule_hash should produce empty-label series; before=%v after=%v", before, got)
+	}
+}
+
+func TestLifecycleDelete_RequiresAdminAuth(t *testing.T) {
+	s := newTestS3IamCacheServer(t, testS3IamCacheSigningKey)
+	_, err := s.LifecycleDelete(context.Background(), &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket: "victim", ObjectPath: "important.dat",
+		ActionKind: s3_lifecycle_pb.ActionKind_EXPIRATION_DAYS,
+	})
+	if got, want := status.Code(err), codes.Unauthenticated; got != want {
+		t.Fatalf("LifecycleDelete without token: got code %v, want %v (err=%v)", got, want, err)
+	}
+	bad := security.GenJwtForFilerAdmin(security.SigningKey("a-different-key"), 60)
+	_, err = s.LifecycleDelete(s3IamCacheBearerCtx(string(bad)), &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket: "victim", ObjectPath: "important.dat",
+		ActionKind: s3_lifecycle_pb.ActionKind_EXPIRATION_DAYS,
+	})
+	if got, want := status.Code(err), codes.Unauthenticated; got != want {
+		t.Fatalf("LifecycleDelete with mis-signed token: got code %v, want %v (err=%v)", got, want, err)
+	}
+}
+
+func TestLifecycleDelete_NoSigningKey_LocalPeerOnly(t *testing.T) {
+	s := newTestS3IamCacheServer(t, "")
+	_, err := s.LifecycleDelete(context.Background(), &s3_lifecycle_pb.LifecycleDeleteRequest{})
+	if got, want := status.Code(err), codes.Unauthenticated; got != want {
+		t.Fatalf("LifecycleDelete with no peer info: got code %v, want %v (err=%v)", got, want, err)
+	}
+	remoteCtx := peer.NewContext(context.Background(),
+		&peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 11111}})
+	_, err = s.LifecycleDelete(remoteCtx, &s3_lifecycle_pb.LifecycleDeleteRequest{})
+	if got, want := status.Code(err), codes.Unauthenticated; got != want {
+		t.Fatalf("LifecycleDelete from remote peer: got code %v, want %v (err=%v)", got, want, err)
+	}
+	localCtx := peer.NewContext(context.Background(),
+		&peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 11111}})
+	resp, err := s.LifecycleDelete(localCtx, &s3_lifecycle_pb.LifecycleDeleteRequest{})
+	if err != nil {
+		t.Fatalf("LifecycleDelete from loopback without signing key: unexpected error %v", err)
+	}
+	if resp == nil || resp.Outcome != s3_lifecycle_pb.LifecycleDeleteOutcome_BLOCKED {
+		t.Fatalf("expected BLOCKED for empty request without signing key, got %v", resp)
+	}
+}
+
+func TestLifecycleDelete_CurrentExpirationRequiresLatestVersion(t *testing.T) {
+	listed := &filer_pb.Entry{
+		Name:       "v_old",
+		Attributes: &filer_pb.FuseAttributes{Mtime: 1_700_000_000, FileSize: 3},
+		Chunks:     []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 3}},
+		Extended:   map[string][]byte{s3_constants.ExtVersionIdKey: []byte("old")},
+	}
+	newer := &filer_pb.Entry{
+		Name:       "v_new",
+		Attributes: &filer_pb.FuseAttributes{Mtime: 1_700_000_100, FileSize: 5},
+		Chunks:     []*filer_pb.FileChunk{{FileId: "3,02637037d6", Size: 5}},
+		Extended:   map[string][]byte{s3_constants.ExtVersionIdKey: []byte("new")},
+	}
+	versionsDir := func(latestId string) *filer_pb.Entry {
+		d := &filer_pb.Entry{Name: "obj" + s3_constants.VersionsFolder, IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}}
+		if latestId != "" {
+			d.Extended = map[string][]byte{
+				s3_constants.ExtLatestVersionIdKey:       []byte(latestId),
+				s3_constants.ExtLatestVersionFileNameKey: []byte("v_" + latestId),
+			}
+		}
+		return d
+	}
+	nullOverwrite := &filer_pb.Entry{
+		Name:       "obj",
+		Attributes: &filer_pb.FuseAttributes{Mtime: 1_700_000_200, FileSize: 7},
+		Chunks:     []*filer_pb.FileChunk{{FileId: "3,03637037d6", Size: 7}},
+		Extended:   map[string][]byte{s3_constants.ExtVersionIdKey: []byte("null")},
+	}
+	cases := []struct {
+		name       string
+		versioning string
+		versionId  string
+		listed     *filer_pb.Entry
+		entries    map[string]*filer_pb.Entry
+		outcome    s3_lifecycle_pb.LifecycleDeleteOutcome
+	}{
+		{"newer version", s3_constants.VersioningEnabled, "old", listed, map[string]*filer_pb.Entry{
+			"/buckets/b/obj.versions":       versionsDir("new"),
+			"/buckets/b/obj.versions/v_old": listed,
+			"/buckets/b/obj.versions/v_new": newer,
+		}, s3_lifecycle_pb.LifecycleDeleteOutcome_NOOP_RESOLVED},
+		{"null version written while suspended", s3_constants.VersioningSuspended, "old", listed, map[string]*filer_pb.Entry{
+			"/buckets/b/obj":                nullOverwrite,
+			"/buckets/b/obj.versions":       versionsDir(""),
+			"/buckets/b/obj.versions/v_old": listed,
+		}, s3_lifecycle_pb.LifecycleDeleteOutcome_NOOP_RESOLVED},
+		{"unaddressed null behind a newer version while suspended", s3_constants.VersioningSuspended, "", nullOverwrite, map[string]*filer_pb.Entry{
+			"/buckets/b/obj":                nullOverwrite,
+			"/buckets/b/obj.versions":       versionsDir("new"),
+			"/buckets/b/obj.versions/v_new": newer,
+		}, s3_lifecycle_pb.LifecycleDeleteOutcome_NOOP_RESOLVED},
+		{"still latest", s3_constants.VersioningEnabled, "old", listed, map[string]*filer_pb.Entry{
+			"/buckets/b/obj.versions":       versionsDir("old"),
+			"/buckets/b/obj.versions/v_old": listed,
+		}, s3_lifecycle_pb.LifecycleDeleteOutcome_DONE},
+	}
+	for _, kind := range []s3_lifecycle_pb.ActionKind{s3_lifecycle_pb.ActionKind_EXPIRATION_DAYS, s3_lifecycle_pb.ActionKind_EXPIRATION_DATE} {
+		for _, c := range cases {
+			t.Run(kind.String()+"/"+c.name, func(t *testing.T) {
+				entries := map[string]*filer_pb.Entry{}
+				for k, v := range c.entries {
+					entries[k] = proto.Clone(v).(*filer_pb.Entry)
+				}
+				fake := &ambiguousPutFiler{entries: entries, apply: true}
+				s3a := newPutTestServer(t, startFakeFiler(t, fake))
+				s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+				s3a.bucketConfigCache.Set("b", &BucketConfig{Name: "b", Versioning: c.versioning})
+				resp, err := s3a.LifecycleDelete(s3LocalPeerCtx(), &s3_lifecycle_pb.LifecycleDeleteRequest{
+					Bucket:           "b",
+					ObjectPath:       "obj",
+					VersionId:        c.versionId,
+					ActionKind:       kind,
+					ExpectedIdentity: computeEntryIdentity(c.listed),
+				})
+				require.NoError(t, err)
+				require.Equal(t, c.outcome, resp.Outcome, resp.Reason)
+				if c.outcome == s3_lifecycle_pb.LifecycleDeleteOutcome_NOOP_RESOLVED {
+					require.Equal(t, "VERSION_NOT_LATEST", resp.Reason)
+					require.Zero(t, fake.txnCount, "no delete marker or delete may be written")
+					require.Len(t, fake.entries, len(c.entries))
+				}
+			})
+		}
+	}
+}
+
+// Expired-marker cleanup removes a marker that a lock was recorded on: markers
+// are never WORM-protected, so the routed delete carries no WORM guard.
+func TestLifecycleDelete_LockedExpiredDeleteMarkerSkipsWormGuard(t *testing.T) {
+	marker := &filer_pb.Entry{
+		Name:       "v_m1",
+		Attributes: &filer_pb.FuseAttributes{Mtime: 1_700_000_000},
+		Extended: map[string][]byte{
+			s3_constants.ExtVersionIdKey:    []byte("m1"),
+			s3_constants.ExtDeleteMarkerKey: []byte("true"),
+			s3_constants.ExtLegalHoldKey:    []byte(s3_constants.LegalHoldOn),
+		},
+	}
+	fake := &ambiguousPutFiler{apply: true, entries: map[string]*filer_pb.Entry{
+		"/buckets/b/obj.versions": {
+			Name:        "obj" + s3_constants.VersionsFolder,
+			IsDirectory: true,
+			Attributes:  &filer_pb.FuseAttributes{},
+			Extended: map[string][]byte{
+				s3_constants.ExtLatestVersionIdKey:       []byte("m1"),
+				s3_constants.ExtLatestVersionFileNameKey: []byte("v_m1"),
+			},
+		},
+		"/buckets/b/obj.versions/v_m1": proto.Clone(marker).(*filer_pb.Entry),
+	}}
+	var conditions []*filer_pb.WriteCondition
+	fake.txnCheck = func(req *filer_pb.ObjectTransactionRequest) { conditions = append(conditions, req.GetCondition()) }
+	addr := startFakeFiler(t, fake)
+	s3a := newPutTestServer(t, addr)
+	s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+	s3a.bucketConfigCache.Set("b", &BucketConfig{
+		Name:             "b",
+		Versioning:       s3_constants.VersioningEnabled,
+		ObjectLockConfig: &ObjectLockConfiguration{ObjectLockEnabled: s3_constants.ObjectLockEnabled},
+	})
+	s3a.objectWriteLockClient = cluster.NewLockClient(s3a.option.GrpcDialOption, addr)
+	s3a.objectWriteLockClient.SetRing([]pb.ServerAddress{addr}, 1)
+
+	resp, err := s3a.LifecycleDelete(s3LocalPeerCtx(), &s3_lifecycle_pb.LifecycleDeleteRequest{
+		Bucket:           "b",
+		ObjectPath:       "obj",
+		VersionId:        "m1",
+		ActionKind:       s3_lifecycle_pb.ActionKind_EXPIRED_DELETE_MARKER,
+		ExpectedIdentity: computeEntryIdentity(marker),
+	})
+	require.NoError(t, err)
+	require.Equal(t, s3_lifecycle_pb.LifecycleDeleteOutcome_DONE, resp.Outcome, resp.Reason)
+	require.Len(t, conditions, 1)
+	require.Nil(t, conditions[0], "marker delete must not carry WORM guards")
+}

@@ -3,7 +3,7 @@ package needle
 import (
 	"testing"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 func TestParseKeyHash(t *testing.T) {
@@ -37,6 +37,14 @@ func TestParseKeyHash(t *testing.T) {
 		} else if id != tc.ID || cookie != tc.Cookie {
 			t.Fatalf("Parse %s wrong result. Expected: (%d, %d) got: (%d, %d)", tc.KeyHash, tc.ID, tc.Cookie, id, cookie)
 		}
+	}
+}
+
+func TestNeedleParsePathRejectsDeltaOverflow(t *testing.T) {
+	var n Needle
+	err := n.ParsePath("ffffffffffffffff00000000_1")
+	if err == nil {
+		t.Fatalf("ParsePath accepted overflowing delta with needle id %d", n.Id)
 	}
 }
 

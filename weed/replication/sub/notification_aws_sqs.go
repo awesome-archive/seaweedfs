@@ -8,10 +8,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/golang/protobuf/proto"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 func init() {
@@ -27,29 +27,30 @@ func (k *AwsSqsInput) GetName() string {
 	return "aws_sqs"
 }
 
-func (k *AwsSqsInput) Initialize(configuration util.Configuration) error {
-	glog.V(0).Infof("replication.notification.aws_sqs.region: %v", configuration.GetString("region"))
-	glog.V(0).Infof("replication.notification.aws_sqs.sqs_queue_name: %v", configuration.GetString("sqs_queue_name"))
+func (k *AwsSqsInput) Initialize(configuration util.Configuration, prefix string) error {
+	glog.V(0).Infof("replication.notification.aws_sqs.region: %v", configuration.GetString(prefix+"region"))
+	glog.V(0).Infof("replication.notification.aws_sqs.sqs_queue_name: %v", configuration.GetString(prefix+"sqs_queue_name"))
 	return k.initialize(
-		configuration.GetString("aws_access_key_id"),
-		configuration.GetString("aws_secret_access_key"),
-		configuration.GetString("region"),
-		configuration.GetString("sqs_queue_name"),
+		configuration.GetString(prefix+"aws_access_key_id"),
+		configuration.GetString(prefix+"aws_secret_access_key"),
+		configuration.GetString(prefix+"region"),
+		configuration.GetString(prefix+"sqs_queue_name"),
 	)
 }
 
-func (k *AwsSqsInput) initialize(awsAccessKeyId, aswSecretAccessKey, region, queueName string) (err error) {
+func (k *AwsSqsInput) initialize(awsAccessKeyId, awsSecretAccessKey, region, queueName string) (err error) {
 
 	config := &aws.Config{
-		Region: aws.String(region),
+		Region:                        aws.String(region),
+		S3DisableContentMD5Validation: aws.Bool(true),
 	}
-	if awsAccessKeyId != "" && aswSecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, aswSecretAccessKey, "")
+	if awsAccessKeyId != "" && awsSecretAccessKey != "" {
+		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyId, awsSecretAccessKey, "")
 	}
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return fmt.Errorf("create aws session: %v", err)
+		return fmt.Errorf("create aws session: %w", err)
 	}
 	k.svc = sqs.New(sess)
 
@@ -68,7 +69,7 @@ func (k *AwsSqsInput) initialize(awsAccessKeyId, aswSecretAccessKey, region, que
 	return nil
 }
 
-func (k *AwsSqsInput) ReceiveMessage() (key string, message *filer_pb.EventNotification, err error) {
+func (k *AwsSqsInput) ReceiveMessage() (key string, message *filer_pb.EventNotification, onSuccessFn func(), onFailureFn func(), err error) {
 
 	// receive message
 	result, err := k.svc.ReceiveMessage(&sqs.ReceiveMessageInput{
@@ -92,19 +93,31 @@ func (k *AwsSqsInput) ReceiveMessage() (key string, message *filer_pb.EventNotif
 	}
 
 	// process the message
-	key = *result.Messages[0].Attributes["key"]
+	// fmt.Printf("messages: %+v\n", result.Messages[0])
+	keyValue := result.Messages[0].MessageAttributes["key"]
+	key = *keyValue.StringValue
 	text := *result.Messages[0].Body
 	message = &filer_pb.EventNotification{}
-	err = proto.UnmarshalText(text, message)
-
-	// delete the message
-	_, err = k.svc.DeleteMessage(&sqs.DeleteMessageInput{
-		QueueUrl:      &k.queueUrl,
-		ReceiptHandle: result.Messages[0].ReceiptHandle,
-	})
-
+	err = proto.Unmarshal([]byte(text), message)
 	if err != nil {
-		glog.V(1).Infof("delete message from sqs %s: %v", k.queueUrl, err)
+		err = fmt.Errorf("unmarshal message from sqs %s: %w", k.queueUrl, err)
+		return
+	}
+
+	// Delete only once the message has been replicated. Deleting on receipt
+	// drops the message for good when the sink write fails; leaving it in the
+	// queue lets the visibility timeout redeliver it.
+	receiptHandle := result.Messages[0].ReceiptHandle
+	onSuccessFn = func() {
+		if _, deleteErr := k.svc.DeleteMessage(&sqs.DeleteMessageInput{
+			QueueUrl:      &k.queueUrl,
+			ReceiptHandle: receiptHandle,
+		}); deleteErr != nil {
+			glog.V(1).Infof("delete message from sqs %s: %v", k.queueUrl, deleteErr)
+		}
+	}
+	onFailureFn = func() {
+		glog.V(1).Infof("keeping message %s in sqs %s for redelivery", key, k.queueUrl)
 	}
 
 	return

@@ -1,19 +1,33 @@
 package command
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/server"
-	"github.com/chrislusf/seaweedfs/weed/shell"
-	"github.com/spf13/viper"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/shell"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
-	shellOptions shell.ShellOptions
+	shellOptions        shell.ShellOptions
+	shellInitialFiler   *string
+	shellCluster        *string
+	shellDebug          *bool
+	shellConnectTimeout *time.Duration
 )
 
 func init() {
 	cmdShell.Run = runShell // break init cycle
-	shellOptions.Masters = cmdShell.Flag.String("master", "localhost:9333", "comma-separated master servers")
+	shellOptions.Masters = cmdShell.Flag.String("master", "", "comma-separated master servers, e.g. localhost:9333")
+	shellOptions.FilerGroup = cmdShell.Flag.String("filerGroup", "", "filerGroup for the filers")
+	shellInitialFiler = cmdShell.Flag.String("filer", "", "filer host and port for initial connection, e.g. localhost:8888")
+	shellCluster = cmdShell.Flag.String("cluster", "", "cluster defined in shell.toml")
+	shellDebug = cmdShell.Flag.Bool("debug", false, "print informational logs to stderr")
+	shellConnectTimeout = cmdShell.Flag.Duration("connectTimeout", 30*time.Second, "timeout for the initial master connection and filer discovery")
 }
 
 var cmdShell = &Command{
@@ -21,21 +35,48 @@ var cmdShell = &Command{
 	Short:     "run interactive administrative commands",
 	Long: `run interactive administrative commands.
 
-  `,
-}
+	Generate shell.toml via "weed scaffold -config=shell"
 
-var ()
+`,
+}
 
 func runShell(command *Command, args []string) bool {
 
-	weed_server.LoadConfiguration("security", false)
-	shellOptions.GrpcDialOption = security.LoadClientTLS(viper.Sub("grpc"), "client")
-
-	shellOptions.FilerHost = "localhost"
-	shellOptions.FilerPort = 8888
+	util.LoadSecurityConfiguration()
+	shellOptions.GrpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 	shellOptions.Directory = "/"
 
-	shell.RunShell(shellOptions)
+	util.LoadConfiguration("shell", false)
+	viper := util.GetViper()
+	cluster := viper.GetString("cluster.default")
+	if *shellCluster != "" {
+		cluster = *shellCluster
+	}
+
+	if *shellOptions.Masters == "" {
+		if cluster == "" {
+			*shellOptions.Masters = "localhost:9333"
+		} else {
+			*shellOptions.Masters = viper.GetString("cluster." + cluster + ".master")
+		}
+	}
+
+	filerAddress := *shellInitialFiler
+	if filerAddress == "" && cluster != "" {
+		filerAddress = viper.GetString("cluster." + cluster + ".filer")
+	}
+	shellOptions.FilerAddress = pb.ServerAddress(filerAddress)
+	shellOptions.Debug = *shellDebug
+	shellOptions.ConnectTimeout = *shellConnectTimeout
+	if shellOptions.Debug {
+		fmt.Fprintf(os.Stderr, "master: %s filer: %s\n", *shellOptions.Masters, shellOptions.FilerAddress)
+	}
+
+	if err := shell.RunShell(shellOptions); err != nil {
+		// The command already printed the error; a piped run has to fail the
+		// script wrapping it too.
+		SetCommandExitStatus(1)
+	}
 
 	return true
 

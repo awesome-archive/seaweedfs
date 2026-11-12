@@ -2,95 +2,128 @@ package operation
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"google.golang.org/grpc"
-	"math/rand"
-	"net/url"
+	"math/rand/v2"
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 type Location struct {
-	Url       string `json:"url,omitempty"`
-	PublicUrl string `json:"publicUrl,omitempty"`
+	Url               string `json:"url,omitempty"`
+	PublicUrl         string `json:"publicUrl,omitempty"`
+	DataCenter        string `json:"dataCenter,omitempty"`
+	GrpcPort          int    `json:"grpcPort,omitempty"`
+	DataInRemote      bool   `json:"dataInRemote,omitempty"`
+	ReadOnly          bool   `json:"readOnly,omitempty"`
+	ReadOnlyCanDelete bool   `json:"readOnlyCanDelete,omitempty"`
 }
+
+func (l *Location) ServerAddress() pb.ServerAddress {
+	return pb.NewServerAddressWithGrpcPort(l.Url, l.GrpcPort)
+}
+
 type LookupResult struct {
-	VolumeId  string     `json:"volumeId,omitempty"`
-	Locations []Location `json:"locations,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	VolumeOrFileId string     `json:"volumeOrFileId,omitempty"`
+	Locations      []Location `json:"locations,omitempty"`
+	Jwt            string     `json:"jwt,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	NotFound       bool       `json:"-"`
 }
 
 func (lr *LookupResult) String() string {
-	return fmt.Sprintf("VolumeId:%s, Locations:%v, Error:%s", lr.VolumeId, lr.Locations, lr.Error)
+	return fmt.Sprintf("VolumeOrFileId:%s, Locations:%v, Error:%s", lr.VolumeOrFileId, lr.Locations, lr.Error)
 }
 
 var (
 	vc VidCache // caching of volume locations, re-check if after 10 minutes
 )
 
-func Lookup(server string, vid string) (ret *LookupResult, err error) {
-	locations, cache_err := vc.Get(vid)
-	if cache_err != nil {
-		if ret, err = do_lookup(server, vid); err == nil {
-			vc.Set(vid, ret.Locations, 10*time.Minute)
-		}
-	} else {
-		ret = &LookupResult{VolumeId: vid, Locations: locations}
+// LookupFileId resolves a "<vid>,<cookie>" file id to one HTTP read URL,
+// preferring a volume server whose replica holds the data locally over one
+// backed by remote-tier storage. If no local replica is known the function
+// falls back to a random remote replica. The returned jwt is the read
+// authorization the master stamped on the volume; pass it through to the
+// volume server on the read request.
+func LookupFileId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, fileId string) (fullUrl string, jwt string, err error) {
+	fullUrls, jwt, err := lookupFileIdUrls(masterFn, grpcDialOption, fileId)
+	if err != nil {
+		return "", jwt, err
 	}
-	return
+	return fullUrls[0], jwt, nil
 }
 
-func do_lookup(server string, vid string) (*LookupResult, error) {
-	values := make(url.Values)
-	values.Add("volumeId", vid)
-	jsonBlob, err := util.Post("http://"+server+"/dir/lookup", values)
-	if err != nil {
-		return nil, err
-	}
-	var ret LookupResult
-	err = json.Unmarshal(jsonBlob, &ret)
-	if err != nil {
-		return nil, err
-	}
-	if ret.Error != "" {
-		return nil, errors.New(ret.Error)
-	}
-	return &ret, nil
-}
-
-func LookupFileId(server string, fileId string) (fullUrl string, err error) {
+// lookupFileIdUrls returns the read URLs of every replica of fileId, local
+// replicas first, each group in random order.
+func lookupFileIdUrls(masterFn GetMasterFn, grpcDialOption grpc.DialOption, fileId string) (fullUrls []string, jwt string, err error) {
 	parts := strings.Split(fileId, ",")
 	if len(parts) != 2 {
-		return "", errors.New("Invalid fileId " + fileId)
+		return nil, jwt, errors.New("Invalid fileId " + fileId)
 	}
-	lookup, lookupError := Lookup(server, parts[0])
+	lookup, lookupError := LookupVolumeId(masterFn, grpcDialOption, parts[0])
 	if lookupError != nil {
-		return "", lookupError
+		return nil, jwt, lookupError
 	}
 	if len(lookup.Locations) == 0 {
-		return "", errors.New("File Not Found")
+		return nil, jwt, errors.New("File Not Found")
 	}
-	return "http://" + lookup.Locations[rand.Intn(len(lookup.Locations))].Url + "/" + fileId, nil
+
+	var localUrls, remoteUrls []string
+	for _, loc := range lookup.Locations {
+		fullUrl := "http://" + loc.Url + "/" + fileId
+		if loc.DataInRemote {
+			remoteUrls = append(remoteUrls, fullUrl)
+		} else {
+			localUrls = append(localUrls, fullUrl)
+		}
+	}
+	rand.Shuffle(len(localUrls), func(i, j int) { localUrls[i], localUrls[j] = localUrls[j], localUrls[i] })
+	rand.Shuffle(len(remoteUrls), func(i, j int) { remoteUrls[i], remoteUrls[j] = remoteUrls[j], remoteUrls[i] })
+
+	return append(localUrls, remoteUrls...), lookup.Jwt, nil
+}
+
+func LookupVolumeId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid string) (*LookupResult, error) {
+	return LookupVolumeIdWithContext(context.Background(), masterFn, grpcDialOption, vid)
+}
+
+func LookupVolumeIdWithContext(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid string) (*LookupResult, error) {
+	results, err := LookupVolumeIdsWithContext(ctx, masterFn, grpcDialOption, []string{vid})
+	return results[vid], err
+}
+
+// InvalidateVolumeIdLocationCache drops cached locations for vid so the next lookup re-queries the master.
+func InvalidateVolumeIdLocationCache(vid string) {
+	vc.Delete(vid)
 }
 
 // LookupVolumeIds find volume locations by cache and actual lookup
-func LookupVolumeIds(server string, grpcDialOption grpc.DialOption, vids []string) (map[string]LookupResult, error) {
-	ret := make(map[string]LookupResult)
+func LookupVolumeIds(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids []string, useCache ...bool) (map[string]*LookupResult, error) {
+	return LookupVolumeIdsWithContext(context.Background(), masterFn, grpcDialOption, vids, useCache...)
+}
+
+// LookupVolumeIdsWithContext is LookupVolumeIds bound to ctx, so a caller's
+// cancellation (e.g. a dropped inbound request) also stops the master query.
+func LookupVolumeIdsWithContext(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids []string, useCache ...bool) (map[string]*LookupResult, error) {
+	ret := make(map[string]*LookupResult)
 	var unknown_vids []string
+	cacheLocations := len(useCache) == 0 || useCache[0]
 
 	//check vid cache first
 	for _, vid := range vids {
-		locations, cache_err := vc.Get(vid)
-		if cache_err == nil {
-			ret[vid] = LookupResult{VolumeId: vid, Locations: locations}
-		} else {
-			unknown_vids = append(unknown_vids, vid)
+		if cacheLocations {
+			locations, cacheErr := vc.Get(vid)
+			if cacheErr == nil {
+				ret[vid] = &LookupResult{VolumeOrFileId: vid, Locations: locations}
+				continue
+			}
 		}
+		unknown_vids = append(unknown_vids, vid)
 	}
 	//return success if all volume ids are known
 	if len(unknown_vids) == 0 {
@@ -99,12 +132,12 @@ func LookupVolumeIds(server string, grpcDialOption grpc.DialOption, vids []strin
 
 	//only query unknown_vids
 
-	err := withMasterServerClient(server, grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+	err := WithMasterServerClient(ctx, false, masterFn(ctx), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 
 		req := &master_pb.LookupVolumeRequest{
-			VolumeIds: unknown_vids,
+			VolumeOrFileIds: unknown_vids,
 		}
-		resp, grpcErr := masterClient.LookupVolume(context.Background(), req)
+		resp, grpcErr := masterClient.LookupVolume(ctx, req)
 		if grpcErr != nil {
 			return grpcErr
 		}
@@ -114,17 +147,23 @@ func LookupVolumeIds(server string, grpcDialOption grpc.DialOption, vids []strin
 			var locations []Location
 			for _, loc := range vidLocations.Locations {
 				locations = append(locations, Location{
-					Url:       loc.Url,
-					PublicUrl: loc.PublicUrl,
+					Url:               loc.Url,
+					PublicUrl:         loc.PublicUrl,
+					DataCenter:        loc.DataCenter,
+					GrpcPort:          int(loc.GrpcPort),
+					DataInRemote:      loc.DataInRemote,
+					ReadOnly:          loc.ReadOnly,
+					ReadOnlyCanDelete: loc.ReadOnlyCanDelete,
 				})
 			}
-			if vidLocations.Error != "" {
-				vc.Set(vidLocations.VolumeId, locations, 10*time.Minute)
+			if cacheLocations && vidLocations.Error == "" {
+				vc.Set(vidLocations.VolumeOrFileId, locations, 10*time.Minute)
 			}
-			ret[vidLocations.VolumeId] = LookupResult{
-				VolumeId:  vidLocations.VolumeId,
-				Locations: locations,
-				Error:     vidLocations.Error,
+			ret[vidLocations.VolumeOrFileId] = &LookupResult{
+				VolumeOrFileId: vidLocations.VolumeOrFileId,
+				Locations:      locations,
+				Jwt:            vidLocations.Auth,
+				Error:          vidLocations.Error,
 			}
 		}
 

@@ -3,10 +3,12 @@ package storage
 import (
 	"os"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/idx"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle_map"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 type NeedleMap struct {
@@ -19,52 +21,45 @@ func NewCompactNeedleMap(file *os.File) *NeedleMap {
 		m: needle_map.NewCompactMap(),
 	}
 	nm.indexFile = file
-	return nm
-}
-
-func NewBtreeNeedleMap(file *os.File) *NeedleMap {
-	nm := &NeedleMap{
-		m: needle_map.NewBtreeMap(),
+	stat, err := file.Stat()
+	if err != nil {
+		glog.Fatalf("stat file %s: %v", file.Name(), err)
 	}
-	nm.indexFile = file
+	nm.indexFileOffset = stat.Size()
 	return nm
 }
 
-func LoadCompactNeedleMap(file *os.File) (*NeedleMap, error) {
+func LoadCompactNeedleMap(file *os.File, version needle.Version) (*NeedleMap, error) {
 	nm := NewCompactNeedleMap(file)
-	return doLoading(file, nm)
+	return doLoading(file, nm, version)
 }
 
-func LoadBtreeNeedleMap(file *os.File) (*NeedleMap, error) {
-	nm := NewBtreeNeedleMap(file)
-	return doLoading(file, nm)
-}
-
-func doLoading(file *os.File, nm *NeedleMap) (*NeedleMap, error) {
-	e := idx.WalkIndexFile(file, func(key NeedleId, offset Offset, size uint32) error {
+func doLoading(file *os.File, nm *NeedleMap, version needle.Version) (*NeedleMap, error) {
+	e := idx.WalkIndexFile(file, 0, func(key NeedleId, offset Offset, size Size) error {
 		nm.MaybeSetMaxFileKey(key)
-		if !offset.IsZero() && size != TombstoneFileSize {
+		nm.MaybeSetMaxNeedleEnd(offset, size, version)
+		if !offset.IsZero() && !size.IsDeleted() {
 			nm.FileCounter++
 			nm.FileByteCounter = nm.FileByteCounter + uint64(size)
 			oldOffset, oldSize := nm.m.Set(NeedleId(key), offset, size)
-			// glog.V(3).Infoln("reading key", key, "offset", offset*NeedlePaddingSize, "size", size, "oldSize", oldSize)
-			if !oldOffset.IsZero() && oldSize != TombstoneFileSize {
+			if !oldOffset.IsZero() && oldSize.IsValid() {
 				nm.DeletionCounter++
 				nm.DeletionByteCounter = nm.DeletionByteCounter + uint64(oldSize)
 			}
 		} else {
 			oldSize := nm.m.Delete(NeedleId(key))
-			// glog.V(3).Infoln("removing key", key, "offset", offset*NeedlePaddingSize, "size", size, "oldSize", oldSize)
-			nm.DeletionCounter++
-			nm.DeletionByteCounter = nm.DeletionByteCounter + uint64(oldSize)
+			if oldSize > 0 {
+				nm.DeletionCounter++
+				nm.DeletionByteCounter = nm.DeletionByteCounter + uint64(oldSize)
+			}
 		}
 		return nil
 	})
-	glog.V(1).Infof("max file key: %d for file: %s", nm.MaxFileKey(), file.Name())
+	glog.V(1).Infof("max file key: %v count: %d deleted: %d for file: %s", nm.MaxFileKey(), nm.FileCount(), nm.DeletedCount(), file.Name())
 	return nm, e
 }
 
-func (nm *NeedleMap) Put(key NeedleId, offset Offset, size uint32) error {
+func (nm *NeedleMap) Put(key NeedleId, offset Offset, size Size) error {
 	_, oldSize := nm.m.Set(NeedleId(key), offset, size)
 	nm.logPut(key, oldSize, size)
 	return nm.appendToIndexFile(key, offset, size)
@@ -78,10 +73,77 @@ func (nm *NeedleMap) Delete(key NeedleId, offset Offset) error {
 	nm.logDelete(deletedBytes)
 	return nm.appendToIndexFile(key, offset, TombstoneFileSize)
 }
+
+// reset drops all mappings and counters, e.g. before the index is reloaded
+// after a rolled-back batch
+func (nm *NeedleMap) reset() {
+	nm.m = needle_map.NewCompactMap()
+	nm.restoreBatchMetrics(batchMapMetricSnapshot{})
+}
 func (nm *NeedleMap) Close() {
+	if nm.indexFile == nil {
+		return
+	}
+	indexFileName := nm.indexFile.Name()
+	if err := nm.indexFile.Sync(); err != nil {
+		glog.Warningf("sync file %s failed, %v", indexFileName, err)
+	}
 	_ = nm.indexFile.Close()
 }
 func (nm *NeedleMap) Destroy() error {
 	nm.Close()
 	return os.Remove(nm.indexFile.Name())
+}
+
+func (nm *NeedleMap) UpdateNeedleMap(v *Volume, indexFile *os.File, opts *opt.Options, ldbTimeout int64) error {
+	if v.nm != nil {
+		v.nm.Close()
+		v.nm = nil
+	}
+	defer func() {
+		if v.tmpNm != nil {
+			v.tmpNm.Close()
+			v.tmpNm = nil
+		}
+	}()
+	nm.indexFile = indexFile
+	stat, err := indexFile.Stat()
+	if err != nil {
+		glog.Fatalf("stat file %s: %v", indexFile.Name(), err)
+		return err
+	}
+	nm.indexFileOffset = stat.Size()
+	v.nm = nm
+	v.tmpNm = nil
+	return nil
+}
+
+func (nm *NeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startFrom uint64) error {
+	glog.V(0).Infof("loading idx from offset %d for file: %s", startFrom, indexFile.Name())
+	version := needle.GetCurrentVersion()
+	if v != nil {
+		version = v.Version()
+	}
+	e := idx.WalkIndexFile(indexFile, startFrom, func(key NeedleId, offset Offset, size Size) error {
+		nm.MaybeSetMaxFileKey(key)
+		nm.MaybeSetMaxNeedleEnd(offset, size, version)
+		if !offset.IsZero() && !size.IsDeleted() {
+			nm.FileCounter++
+			nm.FileByteCounter = nm.FileByteCounter + uint64(size)
+			oldOffset, oldSize := nm.m.Set(NeedleId(key), offset, size)
+			if !oldOffset.IsZero() && oldSize.IsValid() {
+				nm.DeletionCounter++
+				nm.DeletionByteCounter = nm.DeletionByteCounter + uint64(oldSize)
+			}
+		} else {
+			oldSize := nm.m.Delete(NeedleId(key))
+			if oldSize > 0 {
+				nm.DeletionCounter++
+				nm.DeletionByteCounter = nm.DeletionByteCounter + uint64(oldSize)
+			}
+		}
+		return nil
+	})
+
+	return e
 }

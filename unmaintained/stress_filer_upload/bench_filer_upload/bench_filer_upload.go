@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"mime/multipart"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -31,8 +32,8 @@ type stat struct {
 }
 
 func main() {
-
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
 	data := make([]byte, *size)
 	println("data len", len(data))
@@ -44,16 +45,12 @@ func main() {
 		go func(x int) {
 			defer wg.Done()
 
-			client := &http.Client{Transport: &http.Transport{
-				MaxConnsPerHost:     1024,
-				MaxIdleConnsPerHost: 1024,
-			}}
 			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(x)))
 
 			for t := 0; t < *times; t++ {
 				for f := 0; f < *fileCount; f++ {
 					fn := r.Intn(*fileCount)
-					if size, err := uploadFileToFiler(client, data, fmt.Sprintf("file%04d", fn), *destination); err == nil {
+					if size, err := uploadFileToFiler(data, fmt.Sprintf("file%04d", fn), *destination); err == nil {
 						statsChan <- stat{
 							size: size,
 						}
@@ -67,6 +64,7 @@ func main() {
 
 	go func() {
 		ticker := time.NewTicker(1000 * time.Millisecond)
+		defer ticker.Stop()
 
 		var lastTime time.Time
 		var counter, size int64
@@ -93,7 +91,7 @@ func main() {
 
 }
 
-func uploadFileToFiler(client *http.Client, data []byte, filename, destination string) (size int64, err error) {
+func uploadFileToFiler(data []byte, filename, destination string) (size int64, err error) {
 
 	if !strings.HasSuffix(destination, "/") {
 		destination = destination + "/"
@@ -115,11 +113,14 @@ func uploadFileToFiler(client *http.Client, data []byte, filename, destination s
 
 	uri := destination + filename
 
-	request, err := http.NewRequest("POST", uri, body)
+	request, err := http.NewRequest(http.MethodPost, uri, body)
+	if err != nil {
+		return 0, fmt.Errorf("http POST %s: %v", uri, err)
+	}
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	// request.Close = true  // can not use this, which do not reuse http connection, impacting filer->volume also.
 
-	resp, err := client.Do(request)
+	resp, err := util_http.GetGlobalHttpClient().Do(request)
 	if err != nil {
 		return 0, fmt.Errorf("http POST %s: %v", uri, err)
 	} else {
@@ -128,7 +129,7 @@ func uploadFileToFiler(client *http.Client, data []byte, filename, destination s
 		if err != nil {
 			return 0, fmt.Errorf("read http POST %s response: %v", uri, err)
 		}
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 

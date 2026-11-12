@@ -8,8 +8,7 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 /*
@@ -17,7 +16,7 @@ import (
 To see the memory usage:
 
 go test -run TestMemoryUsage
-The TotalAlloc section shows the memory increase for each iteration.
+The Alloc section shows the in-use memory increase for each iteration.
 
 go test -run TestMemoryUsage -memprofile=mem.out
 go tool pprof --alloc_space needle.test mem.out
@@ -32,7 +31,7 @@ func TestMemoryUsage(t *testing.T) {
 
 	startTime := time.Now()
 	for i := 0; i < 10; i++ {
-		indexFile, ie := os.OpenFile("../../../test/sample.idx", os.O_RDWR|os.O_RDONLY, 0644)
+		indexFile, ie := os.OpenFile("../../../test/data/sample.idx", os.O_RDWR|os.O_RDONLY, 0644)
 		if ie != nil {
 			log.Fatalln(ie)
 		}
@@ -44,6 +43,7 @@ func TestMemoryUsage(t *testing.T) {
 
 		PrintMemUsage(totalRowCount)
 		now := time.Now()
+		fmt.Printf("\tCompactMap = %s", m.String())
 		fmt.Printf("\tTaken = %v\n", now.Sub(startTime))
 		startTime = now
 	}
@@ -60,7 +60,7 @@ func loadNewNeedleMap(file *os.File) (*CompactMap, uint64) {
 			rowCount++
 			key := BytesToNeedleId(bytes[i : i+NeedleIdSize])
 			offset := BytesToOffset(bytes[i+NeedleIdSize : i+NeedleIdSize+OffsetSize])
-			size := util.BytesToUint32(bytes[i+NeedleIdSize+OffsetSize : i+NeedleIdSize+OffsetSize+SizeSize])
+			size := BytesToSize(bytes[i+NeedleIdSize+OffsetSize : i+NeedleIdSize+OffsetSize+SizeSize])
 
 			if !offset.IsZero() {
 				m.Set(NeedleId(key), offset, size)
@@ -82,7 +82,7 @@ func PrintMemUsage(totalRowCount uint64) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	// For info on each, see: https://golang.org/pkg/runtime/#MemStats
-	fmt.Printf("Each %.2f Bytes", float64(m.TotalAlloc)/float64(totalRowCount))
+	fmt.Printf("Each %.02f Bytes", float64(m.Alloc)/float64(totalRowCount))
 	fmt.Printf("\tAlloc = %v MiB", bToMb(m.Alloc))
 	fmt.Printf("\tTotalAlloc = %v MiB", bToMb(m.TotalAlloc))
 	fmt.Printf("\tSys = %v MiB", bToMb(m.Sys))

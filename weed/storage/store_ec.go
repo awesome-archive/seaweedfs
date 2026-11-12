@@ -1,21 +1,1540 @@
 package storage
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/klauspost/reedsolomon"
+	"golang.org/x/sync/semaphore"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
+
+// errShardNotLocal indicates that the requested EC shard is simply not
+// stored on this volume server. It is expected during normal reads when
+// shards are spread across multiple servers, so callers should not log
+// it as an error.
+var errShardNotLocal = errors.New("ec shard not on this server")
+
+// FindEcShardTargetLocation returns the disk that should receive a new
+// shard / index file for (collection, vid). The selection order is:
+//
+//  0. a disk that already owns one of shardIds (in-memory claim),
+//  1. a disk that already has the EC volume mounted (in-memory state),
+//  2. a disk that owns the .ecx file on disk (volume not mounted yet),
+//  3. any HDD with free space,
+//  4. any disk with free space.
+//
+// Step 0 keeps the per-server invariant that a shard id is owned by at
+// most one disk. Steps 1-4 only know the volume, and a multi-disk server
+// legitimately mounts the same vid on several disks, so the free-count
+// tie-break alone can send a re-copy of a shard the server already holds
+// (a retried ec.balance / ec.rebuild move) to a sibling disk. Both disks
+// then claim the same (vid, shard) and report it to the master from two
+// disk ids, and which claimant serves reads or survives a later
+// unmount/delete of the shard id becomes an accident of Locations order.
+// Overwriting in place is what the caller meant, so an owning disk wins
+// ahead of the space filters too — a re-copy of a shard already on that
+// disk needs no new shard slot, and a genuinely full disk fails the
+// write with ENOSPC rather than silently splitting the claim.
+//
+// Step 2 is the missing primitive that pinned subsequent shards to the
+// first-shard disk during ec.rebuild. ec.rebuild only sets CopyEcxFile=true
+// for the first shard, then relies on auto-select to land later shards on
+// the same disk. Without an on-disk check, FindEcVolume returns nothing
+// (no mount yet) and the fallback picks "any HDD with free space" — which
+// can split shards from their index files across disks of the same node
+// and lose them at startup. See issue #9212 and the orphan-shard
+// reconciliation in #9244.
+//
+// dataShardCount is the data-shard count for this volume's EC layout (10
+// for the OSS default, but custom ratios are supported via .vif). Callers
+// pass it explicitly so this helper stays free of package-level constants
+// — easier to mirror into builds that ship a different default ratio.
+//
+// Implementation walks s.Locations once and scores each disk by tier; the
+// highest-tier disk wins, ties broken by free count. The earlier waterfall
+// across four FindFreeLocation passes was equivalent but acquired
+// volumesLock and ecVolumesLock RLocks (via VolumesLen / EcShardCount) up
+// to four times per disk per call.
+func (s *Store) FindEcShardTargetLocation(collection string, vid needle.VolumeId, dataShardCount int, shardIds ...erasure_coding.ShardId) *DiskLocation {
+	const (
+		tierAnyDisk = iota + 1
+		tierHDD
+		tierEcxOnDisk
+		tierMounted
+		tierOwnsShard
+	)
+
+	var (
+		best      *DiskLocation
+		bestTier  int
+		bestOwned int
+		bestFree  int32
+	)
+	for _, loc := range s.Locations {
+		owned := ownedEcShardCount(loc, vid, shardIds)
+		if loc.readOnlyMount {
+			// A read-only owner still owns the shard: placing another copy
+			// on a writable sibling would register it on two disks.
+			if owned > 0 {
+				return nil
+			}
+			continue
+		}
+		freeCount := ecFreeShardCount(loc, dataShardCount)
+		if owned == 0 {
+			if loc.isDiskSpaceLow.Load() {
+				continue
+			}
+			if freeCount <= 0 {
+				continue
+			}
+		}
+		tier := tierAnyDisk
+		if loc.DiskType == types.HardDriveType {
+			tier = tierHDD
+		}
+		if loc.HasEcxFileOnDisk(collection, vid) {
+			tier = tierEcxOnDisk
+		}
+		if _, mounted := loc.FindEcVolume(vid); mounted {
+			tier = tierMounted
+		}
+		if owned > 0 {
+			tier = tierOwnsShard
+		}
+		better := best == nil || tier > bestTier
+		if !better && tier == bestTier {
+			// owned only separates disks inside tierOwnsShard; it is 0
+			// everywhere else, so this falls through to the free-count
+			// tie-break for the other tiers.
+			better = owned > bestOwned || (owned == bestOwned && freeCount > bestFree)
+		}
+		if better {
+			best = loc
+			bestTier = tier
+			bestOwned = owned
+			bestFree = freeCount
+		}
+	}
+	return best
+}
+
+// EcShardOwnerDisks returns the distinct disks that already own one of
+// shardIds for vid, in Locations order. More than one owner means the batch
+// has no single correct destination — whichever disk receives it would
+// duplicate a sibling disk's claim — so batch callers must split by owner
+// (VolumeEcShardsCopy refuses such a batch instead of guessing).
+func (s *Store) EcShardOwnerDisks(vid needle.VolumeId, shardIds []erasure_coding.ShardId) []*DiskLocation {
+	var owners []*DiskLocation
+	for _, loc := range s.Locations {
+		if ownedEcShardCount(loc, vid, shardIds) > 0 {
+			owners = append(owners, loc)
+		}
+	}
+	return owners
+}
+
+// ownedEcShardCount reports how many of shardIds this disk already claims
+// for vid, per the in-memory registration the read path and heartbeats use.
+func ownedEcShardCount(loc *DiskLocation, vid needle.VolumeId, shardIds []erasure_coding.ShardId) int {
+	if len(shardIds) == 0 {
+		return 0
+	}
+	loc.ecVolumesLock.RLock()
+	defer loc.ecVolumesLock.RUnlock()
+	ecVolume, found := loc.ecVolumes[vid]
+	if !found {
+		return 0
+	}
+	owned := 0
+	for _, shard := range ecVolume.Shards {
+		for _, shardId := range shardIds {
+			if shard.ShardId == shardId {
+				owned++
+				break
+			}
+		}
+	}
+	return owned
+}
+
+// ecFreeShardCount returns the free EC shard capacity of loc, expressed
+// in shard slots (not volume-equivalent slots). dataShardCount is the
+// data-shard count of the EC layout being placed — see
+// FindEcShardTargetLocation's docstring for why it's a parameter.
+//
+// FindFreeLocation in store.go does the same math but divides by
+// DataShardsCount at the end. That truncation can exclude a disk that
+// still has room for several individual shards (e.g. MaxVolumeCount=1,
+// EcShardCount=1, dataShardCount=10 → reports 0 despite 9 free shard
+// slots), which in this helper would re-route subsequent shards off the
+// .ecx-owning disk and re-introduce the orphan-shard layout #9212 is
+// trying to prevent. So we keep the result in shard slots throughout.
+//
+// MaxVolumeCount == 0 is the "unlimited" sentinel used elsewhere in the
+// store (see hasFreeDiskLocation). Reporting a synthetic large free
+// count keeps unlimited disks eligible while still letting tie-breaks
+// prefer the less-loaded one.
+func ecFreeShardCount(loc *DiskLocation, dataShardCount int) int32 {
+	if dataShardCount <= 0 {
+		return 0
+	}
+	if loc.MaxVolumeCount <= 0 {
+		const unlimitedFree = int32(1 << 30)
+		used := int32(loc.VolumesLen())*int32(dataShardCount) + int32(loc.EcShardCount())
+		if used >= unlimitedFree {
+			return 1
+		}
+		return unlimitedFree - used
+	}
+	free := (loc.MaxVolumeCount - int32(loc.VolumesLen())) * int32(dataShardCount)
+	free -= int32(loc.EcShardCount())
+	if free < 0 {
+		return 0
+	}
+	return free
+}
 
 func (s *Store) CollectErasureCodingHeartbeat() *master_pb.Heartbeat {
 	var ecShardMessages []*master_pb.VolumeEcShardInformationMessage
-	for _, location := range s.Locations {
-		location.ecShardsLock.RLock()
-		for _, ecShards := range location.ecShards {
-			ecShardMessages = append(ecShardMessages, ecShards.ToVolumeInformationMessage()...)
+	collectionEcShardSize := make(map[string]int64)
+	for diskId, location := range s.Locations {
+		location.ecVolumesLock.RLock()
+		for _, ecShards := range location.ecVolumes {
+			if _, _, quarantined := ecShards.GetIoErrorState(); quarantined {
+				continue
+			}
+			ecShardMessages = append(ecShardMessages, ecShards.ToVolumeEcShardInformationMessage(uint32(diskId))...)
+
+			for _, ecShard := range ecShards.Shards {
+				collectionEcShardSize[ecShards.Collection] += ecShard.Size()
+			}
 		}
-		location.ecShardsLock.RUnlock()
+		location.ecVolumesLock.RUnlock()
+	}
+
+	for col, size := range collectionEcShardSize {
+		stats.VolumeServerDiskSizeGauge.WithLabelValues(col, "ec").Set(float64(size))
+	}
+
+	for col := range s.reportedEcCollections {
+		if _, stillHere := collectionEcShardSize[col]; !stillHere {
+			stats.VolumeServerDiskSizeGauge.DeleteLabelValues(col, "ec")
+		}
+	}
+	s.reportedEcCollections = make(map[string]struct{}, len(collectionEcShardSize))
+	for col := range collectionEcShardSize {
+		s.reportedEcCollections[col] = struct{}{}
 	}
 
 	return &master_pb.Heartbeat{
-		EcShards: ecShardMessages,
+		EcShards:      ecShardMessages,
+		HasNoEcShards: len(ecShardMessages) == 0,
 	}
 
+}
+
+func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, sourceDiskType string) error {
+	ownersBefore := s.EcShardOwnerDisks(vid, []erasure_coding.ShardId{shardId})
+	ecVolume, diskId, err := s.LoadEcShardAcrossDisks(collection, vid, shardId)
+	if err != nil {
+		return err
+	}
+	glog.V(0).Infof("MountEcShards %d.%d on disk ID %d", vid, shardId, diskId)
+	// The master must not route reads to a disk already found faulty, and a
+	// caller moving the shard here keeps its source copy on this error. A
+	// shard this call loaded is dropped again, so it does not draw later
+	// copies to the same disk.
+	if _, _, quarantined := ecVolume.GetIoErrorState(); quarantined {
+		if location := s.Locations[diskId]; !slices.Contains(ownersBefore, location) {
+			location.UnloadEcShard(vid, shardId)
+		}
+		return fmt.Errorf("ec volume %d on disk %d is quarantined after IO errors, shard %d not announced", vid, diskId, shardId)
+	}
+
+	// Apply the orchestrator-supplied source disk type so the EC
+	// volume reports under it instead of the location's. Empty means
+	// "fall back to location's disk type" (#9423).
+	if sourceDiskType != "" {
+		ecVolume.SetDiskType(types.ToDiskType(sourceDiskType))
+	}
+
+	si := erasure_coding.NewShardsInfo()
+	si.Set(erasure_coding.NewShardInfo(shardId, erasure_coding.ShardSize(ecVolume.ShardSize())))
+	// Same counts the full EC heartbeat carries, so a volume the master first
+	// learns of here does not read 0 files until the next full heartbeat.
+	fileCount, deleteCount := ecVolume.FileAndDeleteCount()
+	s.NewEcShardsChan <- &master_pb.VolumeEcShardInformationMessage{
+		Id:          uint32(vid),
+		Collection:  collection,
+		EcIndexBits: uint32(si.Bitmap()),
+		ShardSizes:  si.SizesInt64(),
+		DiskType:    string(ecVolume.DiskType()),
+		ExpireAtSec: ecVolume.ExpireAtSec,
+		DiskId:      uint32(diskId),
+		FileCount:   fileCount,
+		DeleteCount: deleteCount,
+		EncodeTsNs:  ecVolume.EncodeTsNs,
+	}
+	s.UpdateMaxVolumeIdSeen(vid)
+	return nil
+}
+
+// LoadEcShardAcrossDisks mounts shardId on whichever local disk holds its
+// file and returns the mounted volume plus the disk it landed on. It emits
+// no heartbeat delta — callers that change the master's view do that
+// themselves (MountEcShards), while same-server repoints that must not flip
+// the master's registration use it directly.
+func (s *Store) LoadEcShardAcrossDisks(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId) (*erasure_coding.EcVolume, uint32, error) {
+	// The .ecx index file may live on a different disk than the one
+	// holding the .ec?? shard being mounted: ec.balance / ec.rebuild can
+	// place the .ecx on one local disk while later distributing shards
+	// across sibling disks of the same volume server. The per-disk
+	// IdxDirectory used by LoadEcShard would ENOENT the .ecx, so look up
+	// the .ecx owner across all DiskLocations once and route NewEcVolume
+	// at the directory that actually has the file. A 0-byte .ecx is
+	// treated as missing here (writeToFile can leave a stub on a failed
+	// EC distribute) so we still scan the rest of the disks.
+	ecxIdxDir, ecxFound := s.findEcxIdxDirForVolume(collection, vid)
+
+	// Collect failures so an all-disks-fail return reports every disk we
+	// tried rather than just the first one. Before this loop reordered
+	// itself to keep going after the first non-ENOENT error, a single
+	// shard-on-disk-without-.ecx situation would bail the loop and the
+	// operator saw "cannot open ec volume index" naming exactly one disk
+	// even when others held a valid index.
+	type diskError struct {
+		dir string
+		err error
+	}
+	var failures []diskError
+
+	for diskId, location := range s.Locations {
+		idxDir := location.IdxDirectory
+		if ecxFound {
+			// Fast path: if findEcxIdxDirForVolume already pointed at
+			// one of this disk's directories, the disk owns the .ecx
+			// and the local IdxDirectory is the right answer — skip
+			// the HasEcxFileOnDisk stat. Only fall back to the sibling
+			// disk's idxDir when this disk's directories are neither.
+			if location.IdxDirectory != ecxIdxDir && location.Directory != ecxIdxDir {
+				if !location.HasEcxFileOnDisk(collection, vid) {
+					idxDir = ecxIdxDir
+				}
+			}
+		}
+		ecVolume, err := location.loadEcShardWithIdxDir(collection, vid, shardId, idxDir)
+		if err == nil {
+			return ecVolume, uint32(diskId), nil
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			// Shard or index not on this disk; another disk may own it.
+			continue
+		}
+		failures = append(failures, diskError{dir: location.Directory, err: err})
+	}
+
+	if len(failures) == 0 {
+		// No disk had the shard or the index; this volume server is not
+		// holding any artefacts for the requested shard. Name what we
+		// scanned for so the operator can tell "no .ecx anywhere" apart
+		// from "shard not on this server".
+		if !ecxFound {
+			return nil, 0, fmt.Errorf("MountEcShards %d.%d: no .ecx index found on any local disk", vid, shardId)
+		}
+		return nil, 0, fmt.Errorf("MountEcShards %d.%d not found on disk", vid, shardId)
+	}
+	// Some disks returned a real (non-ENOENT) error. Report them all so
+	// the caller can see whether the failures cluster around one disk
+	// (likely hardware) or are spread out (likely a config problem).
+	var b []byte
+	for i, f := range failures {
+		if i > 0 {
+			b = append(b, "; "...)
+		}
+		b = append(b, fmt.Sprintf("%s: %v", f.dir, f.err)...)
+	}
+	return nil, 0, fmt.Errorf("MountEcShards %d.%d load failures: %s", vid, shardId, string(b))
+}
+
+func (s *Store) UnmountEcShards(vid needle.VolumeId, shardId erasure_coding.ShardId, reqEncodeTsNs int64) error {
+	// Walk every disk: a split-disk reconciled volume can mount the same vid on
+	// more than one disk, so a first-match unmount would leave a sibling copy
+	// mounted and heartbeating. Emit one deletion delta per disk.
+	unmountedAny := false
+	var lastErr error
+	for diskId, location := range s.Locations {
+		ecShard, found := location.FindEcShard(vid, shardId)
+		if !found {
+			continue
+		}
+		// Capture the encode generation before unloading so the deletion delta
+		// carries it like the mount delta does.
+		var encodeTsNs int64
+		if ecVolume, ok := location.FindEcVolume(vid); ok {
+			encodeTsNs = ecVolume.EncodeTsNs
+		}
+		// Generation fence: when the caller carries a generation (stale-worker
+		// cleanup), only unmount a strictly-older generation; preserve a disk whose
+		// generation is same-or-newer, 0, or unknown, so a stale run cannot unmount
+		// a newer run's live shards. reqEncodeTsNs==0 (legacy/shell) unmounts all.
+		if reqEncodeTsNs > 0 && !(encodeTsNs > 0 && encodeTsNs < reqEncodeTsNs) {
+			glog.V(1).Infof("UnmountEcShards %d.%d disk_id:%d skipped: disk gen %d not older than request gen %d", vid, shardId, diskId, encodeTsNs, reqEncodeTsNs)
+			continue
+		}
+		if deleted := location.UnloadEcShard(vid, shardId); deleted {
+			si := erasure_coding.NewShardsInfo()
+			si.Set(erasure_coding.NewShardInfo(shardId, 0))
+			s.DeletedEcShardsChan <- &master_pb.VolumeEcShardInformationMessage{
+				Id:          uint32(vid),
+				Collection:  ecShard.Collection,
+				EcIndexBits: si.Bitmap(),
+				ShardSizes:  si.SizesInt64(),
+				DiskType:    string(ecShard.DiskType),
+				DiskId:      uint32(diskId),
+				EncodeTsNs:  encodeTsNs,
+			}
+			glog.V(0).Infof("UnmountEcShards %d.%d disk_id:%d", vid, shardId, diskId)
+			unmountedAny = true
+		} else {
+			lastErr = fmt.Errorf("UnmountEcShards %d.%d not found on disk %d", vid, shardId, diskId)
+		}
+	}
+
+	// nil when no disk held the shard (idempotent re-unmount).
+	if !unmountedAny {
+		return lastErr
+	}
+	return nil
+}
+
+func (s *Store) findEcShard(vid needle.VolumeId, shardId erasure_coding.ShardId) (diskId uint32, shard *erasure_coding.EcVolumeShard, found bool) {
+	for diskId, location := range s.Locations {
+		if v, found := location.FindEcShard(vid, shardId); found {
+			return uint32(diskId), v, found
+		}
+	}
+	return 0, nil, false
+}
+
+// FindEcShard returns the shard if any DiskLocation on this server holds it,
+// along with that disk's id.
+func (s *Store) FindEcShard(vid needle.VolumeId, shardId erasure_coding.ShardId) (diskId uint32, shard *erasure_coding.EcVolumeShard, found bool) {
+	return s.findEcShard(vid, shardId)
+}
+
+// FindEcVolumeWithShard returns the EcVolume on the disk that owns the given
+// shard, plus the shard. The read guard must check the identity of the volume
+// that owns the bytes served: on a multi-disk server one vid can hold shards
+// from different encode runs across disks, so a first-match volume can differ.
+func (s *Store) FindEcVolumeWithShard(vid needle.VolumeId, shardId erasure_coding.ShardId) (*erasure_coding.EcVolume, *erasure_coding.EcVolumeShard, bool) {
+	for _, location := range s.Locations {
+		if shard, found := location.FindEcShard(vid, shardId); found {
+			if ev, ok := location.FindEcVolume(vid); ok {
+				return ev, shard, true
+			}
+		}
+	}
+	return nil, nil, false
+}
+
+// EcMetadataDirs lists every directory on this server that could hold an EC
+// volume's metadata — each disk's data and index directory. Startup mirroring
+// gives each shard-bearing disk its own .ecx/.ecj/.vif, but the checksum
+// sidecar is not mirrored and a repair delivers exactly one copy, so a runtime
+// looking only at its own two directories cannot see it. Handing this list to
+// the sidecar resolution keeps one authoritative copy reachable from every
+// runtime rather than duplicating a file that is rewritten as shards are
+// repaired and generations published.
+func (s *Store) EcMetadataDirs() []string {
+	var dirs []string
+	appendDir := func(dir string) {
+		if dir == "" {
+			return
+		}
+		for _, existing := range dirs {
+			if existing == dir {
+				return
+			}
+		}
+		dirs = append(dirs, dir)
+	}
+	for _, location := range s.Locations {
+		appendDir(location.Directory)
+		appendDir(location.IdxDirectory)
+	}
+	return dirs
+}
+
+// FindAllEcVolumes returns every per-disk *EcVolume the store maps for vid. A vid
+// can mount on N disks as N distinct runtimes, and the first-match FindEcVolume
+// hides the siblings — so anything that has to reach the whole volume, rather
+// than any one runtime of it, iterates this instead. Order mirrors the
+// deterministic s.Locations order; nil when no disk holds the vid.
+func (s *Store) FindAllEcVolumes(vid needle.VolumeId) []*erasure_coding.EcVolume {
+	var evs []*erasure_coding.EcVolume
+	for _, location := range s.Locations {
+		if ev, found := location.FindEcVolume(vid); found {
+			evs = append(evs, ev)
+		}
+	}
+	return evs
+}
+
+func (s *Store) FindEcVolume(vid needle.VolumeId) (*erasure_coding.EcVolume, bool) {
+	for _, location := range s.Locations {
+		if s, found := location.FindEcVolume(vid); found {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+// FindEcVolumeDiskIds returns every disk_id on this store that has an
+// EcVolume entry for the given volume. Useful for diagnostic logging
+// when a single FindEcVolume hit hides which disk is actually holding
+// the mount (e.g., the ReceiveFile mounted-volume guard).
+func (s *Store) FindEcVolumeDiskIds(vid needle.VolumeId) []uint32 {
+	var ids []uint32
+	for diskId, location := range s.Locations {
+		if _, found := location.FindEcVolume(vid); found {
+			ids = append(ids, uint32(diskId))
+		}
+	}
+	return ids
+}
+
+// shardFiles is a list of shard files, which is used to return the shard locations
+func (s *Store) CollectEcShards(vid needle.VolumeId, shardFileNames []string) (ecVolume *erasure_coding.EcVolume, found bool) {
+	for _, location := range s.Locations {
+		if s, foundShards := location.CollectEcShards(vid, shardFileNames); foundShards {
+			ecVolume = s
+			found = true
+		}
+	}
+	return
+}
+
+func (s *Store) DestroyEcVolume(vid needle.VolumeId) {
+	for _, location := range s.Locations {
+		location.DestroyEcVolume(vid)
+	}
+}
+
+// UnloadEcVolume drops any in-memory EcVolume for vid from every disk and closes
+// its fds without deleting files, so a following unlink frees the inodes.
+func (s *Store) UnloadEcVolume(vid needle.VolumeId) {
+	for _, location := range s.Locations {
+		location.unloadEcVolume(vid)
+	}
+}
+
+func (s *Store) ReadEcShardNeedle(vid needle.VolumeId, n *needle.Needle, onReadSizeFn func(size types.Size)) (int, error) {
+	for _, location := range s.Locations {
+		if localEcVolume, found := location.FindEcVolume(vid); found {
+
+			offset, size, intervals, err := localEcVolume.LocateEcShardNeedle(n.Id, localEcVolume.Version)
+			if err != nil {
+				return 0, fmt.Errorf("locate in local ec volume: %w", err)
+			}
+			if size.IsDeleted() {
+				return 0, ErrorDeleted
+			}
+
+			if onReadSizeFn != nil {
+				onReadSizeFn(size)
+			}
+
+			glog.V(3).Infof("read ec volume %d offset %d size %d intervals:%+v", vid, offset.ToActualOffset(), size, intervals)
+
+			if len(intervals) > 1 {
+				glog.V(3).Infof("ReadEcShardNeedle needle id %s intervals:%+v", n.String(), intervals)
+			}
+			// ReadBytes re-reads the id out of a possibly corrupt header, so the
+			// requested id is kept aside for the rebuild path to recover under.
+			needleId := n.Id
+			bytes, isDeleted, err := s.readEcShardIntervals(needleId, localEcVolume, intervals)
+			// A holder reporting the needle deleted is authoritative -- deletes are
+			// never invented and never undone -- so answer that ahead of whatever
+			// error the shards it could not gather produced.
+			if isDeleted {
+				return 0, ErrorDeleted
+			}
+			if err != nil {
+				return 0, fmt.Errorf("ReadEcShardIntervals: %w", err)
+			}
+
+			err = n.ReadBytes(bytes, offset.ToActualOffset(), size, localEcVolume.Version)
+			if err != nil {
+				if rebuilt, isDeleted := s.rebuildEcShardNeedle(n, needleId, localEcVolume, intervals, offset.ToActualOffset(), size, bytes); isDeleted {
+					return 0, ErrorDeleted
+				} else if rebuilt != nil {
+					return len(rebuilt), nil
+				}
+				return 0, fmt.Errorf("ec volume %d needle %s offset %d size %d: %w", vid, n.String(), offset.ToActualOffset(), size, err)
+			}
+
+			return len(bytes), nil
+		}
+	}
+	return 0, fmt.Errorf("ec shard %d not found", vid)
+}
+
+var (
+	// ecRecoverBudget bounds the interval-sized buffers EC recovery holds across
+	// all concurrent reads: a peer that is slow to fail keeps a whole fan-out of
+	// them alive for the gRPC timeout, and a burst of those walked servers into an
+	// OOM. A var so a test can narrow it alongside ecRecoverSem.
+	ecRecoverBudget int64 = 256 << 20
+	ecRecoverSem          = semaphore.NewWeighted(ecRecoverBudget)
+)
+
+// ecIntervalReadConcurrency bounds the fan-out of a single needle read. Blocks
+// that follow each other in the .dat live on different shards, so a needle
+// spanning several of them costs one round trip per block when read in sequence.
+const ecIntervalReadConcurrency = 8
+
+func (s *Store) readEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval) (data []byte, is_deleted bool, err error) {
+	// Like the Rust server, read on with the cached locations when the lookup
+	// fails: local shards, a quarantined disk's last-resort copy included, do
+	// not need it.
+	if lookupErr := s.cachedLookupEcShardLocations(ecVolume); lookupErr != nil {
+		glog.V(0).Infof("locate ec volume %d via master grpc %s, using cached locations: %v", ecVolume.VolumeId, s.masterAddress(), lookupErr)
+	}
+
+	var totalSize int
+	for _, interval := range intervals {
+		totalSize += int(interval.Size)
+	}
+	data = make([]byte, totalSize)
+
+	if len(intervals) <= 1 {
+		for _, interval := range intervals {
+			if is_deleted, err = s.readOneEcShardInterval(needleId, ecVolume, interval, data); err != nil {
+				return nil, is_deleted, err
+			}
+		}
+		return data, is_deleted, nil
+	}
+
+	errs := make([]error, len(intervals))
+	var deleted atomic.Bool
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, ecIntervalReadConcurrency)
+	var pos int
+	for i, interval := range intervals {
+		buf := data[pos : pos+int(interval.Size)]
+		pos += int(interval.Size)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			isDeleted, e := s.readOneEcShardInterval(needleId, ecVolume, interval, buf)
+			if isDeleted {
+				deleted.Store(true)
+			}
+			errs[i] = e
+		}()
+	}
+	wg.Wait()
+
+	is_deleted = deleted.Load()
+	for _, e := range errs {
+		if e != nil {
+			return nil, is_deleted, e
+		}
+	}
+	return data, is_deleted, nil
+}
+
+// readOneEcShardInterval fills data, which must be interval.Size long.
+func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, interval erasure_coding.Interval, data []byte) (is_deleted bool, err error) {
+	shardId, actualOffset := ecVolume.IntervalToShardIdAndOffset(interval)
+
+	// try local read
+	localErr := s.readLocalEcShardInterval(ecVolume, shardId, data, actualOffset, false)
+	if localErr == nil {
+		return
+	}
+	if errors.Is(localErr, errShardNotLocal) {
+		// expected when shards are spread across servers; fall through to remote read
+		glog.V(4).Infof("ec shard %d.%d not local, will try remote: %v", ecVolume.VolumeId, shardId, localErr)
+	} else {
+		glog.V(0).Infof("read local ec shard %d.%d offset %d: %v", ecVolume.VolumeId, shardId, actualOffset, localErr)
+	}
+
+	ecVolume.ShardLocationsLock.RLock()
+	sourceDataNodes, hasShardIdLocation := ecVolume.ShardLocations[shardId]
+	ecVolume.ShardLocationsLock.RUnlock()
+
+	// try reading directly
+	if hasShardIdLocation {
+		_, is_deleted, err = s.readRemoteEcShardInterval(sourceDataNodes, needleId, ecVolume.VolumeId, shardId, data, actualOffset, ecVolume.EncodeTsNs)
+		if err == nil {
+			return
+		}
+		glog.V(0).Infof("read remote ec shard %d.%d locations: %v", ecVolume.VolumeId, shardId, err)
+		// Recovery below skips this very shard, so nothing else invalidates the
+		// location that just failed -- and a shard that has moved would otherwise
+		// be reconstructed on every read until the map's own window expires.
+		markShardLocationsStale(ecVolume)
+	}
+
+	// try reading by recovering from other shards
+	_, is_deleted, err = s.recoverOneRemoteEcShardInterval(needleId, ecVolume, shardId, data, actualOffset)
+	noteEcReconstructedInterval(ecVolume, needleId, shardId, err)
+	if err == nil {
+		return
+	}
+	glog.V(0).Infof("recover ec shard %d.%d : %v", ecVolume.VolumeId, shardId, err)
+
+	if !is_deleted && errors.Is(localErr, errShardQuarantined) {
+		lastErr := s.readLocalEcShardInterval(ecVolume, shardId, data, actualOffset, true)
+		if lastErr == nil {
+			glog.V(0).Infof("read ec shard %d.%d from its quarantined disk: no healthy copy answered", ecVolume.VolumeId, shardId)
+			return false, nil
+		}
+		glog.V(0).Infof("read quarantined ec shard %d.%d offset %d: %v", ecVolume.VolumeId, shardId, actualOffset, lastErr)
+	}
+
+	return
+}
+
+// rebuildEcShardNeedle repairs a needle whose reassembled bytes failed to
+// parse: a shard that served an interval can be silently corrupt, so each
+// interval's source shard is a suspect. Rebuilding the suspect ranges from the
+// surviving shards — with the suspects excluded from the gather, so a bad copy
+// cannot poison its own reconstruction — produces the bytes Reed-Solomon says
+// are right, and a successful needle parse arbitrates them correct. On success
+// the parse has already hydrated n, every shard whose range changed is dropped
+// from the location cache, and the repaired bytes are returned. Nil when no
+// hypothesis parses (index or needle corrupt in all shards alike). A deleted
+// report from a holder stops the search: deletes are never invented, so the
+// needle is gone whatever the local index says.
+func (s *Store) rebuildEcShardNeedle(n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval, offset int64, size types.Size, corrupted []byte) ([]byte, bool) {
+	ecCtx := ecVolume.ECContext
+	if ecCtx == nil {
+		ecCtx = erasure_coding.NewDefaultECContext(ecVolume.Collection, ecVolume.VolumeId)
+	}
+
+	shardIds := make([]erasure_coding.ShardId, len(intervals))
+	offsets := make([]int64, len(intervals))
+	suspects := make(map[erasure_coding.ShardId]bool)
+	for i, interval := range intervals {
+		shardIds[i], offsets[i] = ecVolume.IntervalToShardIdAndOffset(interval)
+		suspects[shardIds[i]] = true
+	}
+
+	try := func(exclude map[erasure_coding.ShardId]bool) ([]byte, bool) {
+		candidate := make([]byte, len(corrupted))
+		pos := 0
+		for i, interval := range intervals {
+			buf := candidate[pos : pos+int(interval.Size)]
+			pos += int(interval.Size)
+			if !exclude[shardIds[i]] {
+				copy(buf, corrupted[pos-int(interval.Size):pos])
+				continue
+			}
+			_, isDeleted, err := s.recoverEcShardInterval(needleId, ecVolume, shardIds[i], buf, offsets[i], exclude)
+			if isDeleted {
+				return nil, true
+			}
+			if err != nil {
+				return nil, false
+			}
+		}
+		// A candidate whose header decodes a different id than was asked for is
+		// no proof the bytes are right, whatever the checksum said. Parse into a
+		// scratch needle: a failed earlier parse can leave stale fields in n.
+		check := &needle.Needle{Id: needleId}
+		if check.ReadBytes(candidate, offset, size, ecVolume.Version) != nil || check.Id != needleId {
+			return nil, false
+		}
+		// The parse verdict makes every differing range a confirmed corruption.
+		pos = 0
+		for i, interval := range intervals {
+			if !bytes.Equal(candidate[pos:pos+int(interval.Size)], corrupted[pos:pos+int(interval.Size)]) {
+				forgetShardId(ecVolume, shardIds[i])
+			}
+			pos += int(interval.Size)
+		}
+		*n = *check
+		return candidate, false
+	}
+
+	// When parity still covers every suspect, one pass excludes them all and
+	// repairs any subset of them being corrupt at once. Otherwise one suspect
+	// is rebuilt at a time, which fixes a single corrupt suspect.
+	if len(suspects) <= ecCtx.ParityShards {
+		if candidate, isDeleted := try(suspects); isDeleted {
+			return nil, true
+		} else if candidate != nil {
+			return candidate, false
+		}
+		// The gather behind a failed candidate can itself have read a second
+		// corrupt shard as reconstruction input. With slack left in the parity
+		// budget, retry while dropping one gathered input at a time.
+		if len(suspects) < ecCtx.ParityShards {
+			if candidate, isDeleted := s.rebuildEcNeedleFromDroppedInputs(n, needleId, ecVolume, ecCtx, intervals, shardIds, offsets, offset, size, corrupted, suspects); isDeleted {
+				return nil, true
+			} else if candidate != nil {
+				return candidate, false
+			}
+		}
+	}
+	if candidate, isDeleted := s.rebuildEcNeedleFromCorruptSets(n, needleId, ecVolume, ecCtx, intervals, shardIds, offsets, offset, size, corrupted, suspects); isDeleted {
+		return nil, true
+	} else if candidate != nil {
+		return candidate, false
+	}
+	if len(suspects) == 1 {
+		return nil, false
+	}
+	for shardId := range suspects {
+		if candidate, isDeleted := try(map[erasure_coding.ShardId]bool{shardId: true}); isDeleted {
+			return nil, true
+		} else if candidate != nil {
+			return candidate, false
+		}
+	}
+	return nil, false
+}
+
+// rebuildEcNeedleFromDroppedInputs handles a rebuild whose every suspect range
+// was recovered yet the candidate still failed to parse: the gather behind it
+// can itself have read a second corrupt shard as reconstruction input. Each
+// interval is gathered once — keeping every shard that answers rather than
+// stopping at DataShards — then the decode is retried with one gathered input
+// dropped at a time and a needle parse arbitrates. The hypotheses tried are
+// the inputs the first decode consumed, the only shards whose corruption can
+// explain the failed candidate. Nil when no dropped-input subset parses.
+func (s *Store) rebuildEcNeedleFromDroppedInputs(n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, intervals []erasure_coding.Interval, shardIds []erasure_coding.ShardId, offsets []int64, offset int64, size types.Size, corrupted []byte, suspects map[erasure_coding.ShardId]bool) ([]byte, bool) {
+	var totalSize int64
+	for _, interval := range intervals {
+		totalSize += int64(interval.Size)
+	}
+	weight := totalSize * int64(ecCtx.Total())
+	if weight > ecRecoverBudget {
+		weight = ecRecoverBudget
+	}
+	if err := ecRecoverSem.Acquire(context.Background(), weight); err != nil {
+		return nil, false
+	}
+	defer ecRecoverSem.Release(weight)
+
+	gathers := make([][][]byte, len(intervals))
+	picked := make(map[erasure_coding.ShardId]bool)
+	for i, interval := range intervals {
+		shardIntervals, isDeleted := s.gatherEcShardIntervals(needleId, ecVolume, ecCtx, suspects, int(interval.Size), offsets[i], ecCtx.Total())
+		if isDeleted {
+			return nil, true
+		}
+		taken := 0
+		for shardId := 0; shardId < ecCtx.Total() && taken < ecCtx.DataShards; shardId++ {
+			if shardIntervals[shardId] != nil {
+				picked[erasure_coding.ShardId(shardId)] = true
+				taken++
+			}
+		}
+		gathers[i] = shardIntervals
+	}
+
+	for drop := erasure_coding.ShardId(0); int(drop) < ecCtx.Total(); drop++ {
+		if !picked[drop] {
+			continue
+		}
+		candidate := make([]byte, len(corrupted))
+		copy(candidate, corrupted)
+		pos := 0
+		ok := true
+		for i, interval := range intervals {
+			view := slices.Clone(gathers[i])
+			view[drop] = nil
+			if err := reconstructEcShardInterval(ecVolume, ecCtx, view, shardIds[i]); err != nil {
+				ok = false
+				break
+			}
+			copy(candidate[pos:pos+int(interval.Size)], view[shardIds[i]])
+			pos += int(interval.Size)
+		}
+		if !ok {
+			continue
+		}
+		check := &needle.Needle{Id: needleId}
+		if check.ReadBytes(candidate, offset, size, ecVolume.Version) != nil || check.Id != needleId {
+			continue
+		}
+		// The verdict convicts every differing range — and the dropped input,
+		// without which the same decode kept failing to parse.
+		pos = 0
+		for i, interval := range intervals {
+			if !bytes.Equal(candidate[pos:pos+int(interval.Size)], corrupted[pos:pos+int(interval.Size)]) {
+				forgetShardId(ecVolume, shardIds[i])
+			}
+			pos += int(interval.Size)
+		}
+		forgetShardId(ecVolume, drop)
+		*n = *check
+		return candidate, false
+	}
+	return nil, false
+}
+
+// ecRebuildMaxSets bounds how many candidate corrupt sets one needle's search
+// enumerates, and ecRebuildMaxBytes the needle bytes it rebuilds and parses
+// past the single-shard sets. 10+4 has 1470 sets of at most four shards.
+const (
+	ecRebuildMaxSets  = 4096
+	ecRebuildMaxBytes = 1 << 30
+)
+
+// rebuildEcNeedleFromCorruptSets handles a rebuild the retries above could not
+// repair: more shards than one can be corrupt over the same ranges and get read
+// as reconstruction inputs. Each interval is gathered once from every other
+// shard that answers, then each set of up to ParityShards shards holding a
+// suspect is tried as the corrupt set, smallest first: suspect ranges inside it
+// are rebuilt from the shards outside it, the rest keep the bytes read, and a
+// needle parse arbitrates. A set whose decodes read the same inputs as one
+// already tried is skipped. Nil when that gather would outgrow the recovery
+// budget, or no set parses.
+func (s *Store) rebuildEcNeedleFromCorruptSets(n *needle.Needle, needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, intervals []erasure_coding.Interval, shardIds []erasure_coding.ShardId, offsets []int64, offset int64, size types.Size, corrupted []byte, suspects map[erasure_coding.ShardId]bool) ([]byte, bool) {
+	var totalSize int64
+	for _, interval := range intervals {
+		totalSize += int64(interval.Size)
+	}
+	total := ecCtx.Total()
+	if totalSize*int64(total-1) > ecRecoverBudget {
+		return nil, false
+	}
+	weight := totalSize * int64(total)
+	if weight > ecRecoverBudget {
+		weight = ecRecoverBudget
+	}
+	if err := ecRecoverSem.Acquire(context.Background(), weight); err != nil {
+		return nil, false
+	}
+	defer ecRecoverSem.Release(weight)
+
+	gathers := make([][][]byte, len(intervals))
+	for i, interval := range intervals {
+		shardIntervals, isDeleted := s.gatherEcShardIntervals(needleId, ecVolume, ecCtx, map[erasure_coding.ShardId]bool{shardIds[i]: true}, int(interval.Size), offsets[i], total)
+		if isDeleted {
+			return nil, true
+		}
+		gathers[i] = shardIntervals
+	}
+
+	enc, err := reedsolomon.New(ecCtx.DataShards, ecCtx.ParityShards)
+	if err != nil {
+		return nil, false
+	}
+	candidate := slices.Clone(corrupted)
+	required := make([]bool, total)
+	view := make([][]byte, total)
+	inputs := make([]uint64, len(intervals))
+	tried := make(map[string]bool)
+
+	// plan records in inputs the shards each interval's decode reads when set
+	// is excluded, 0 for an interval that keeps its bytes. False when an
+	// interval has too few shards left, or the same decodes were tried before.
+	plan := func(set uint64) bool {
+		for i := range intervals {
+			inputs[i] = 0
+			if set&(1<<shardIds[i]) == 0 {
+				continue
+			}
+			taken := 0
+			for shardId := 0; shardId < total && taken < ecCtx.DataShards; shardId++ {
+				if set&(1<<shardId) == 0 && gathers[i][shardId] != nil {
+					inputs[i] |= 1 << shardId
+					taken++
+				}
+			}
+			if taken < ecCtx.DataShards {
+				return false
+			}
+		}
+		key := fmt.Sprint(inputs)
+		if tried[key] {
+			return false
+		}
+		tried[key] = true
+		return true
+	}
+
+	// decode rebuilds the planned intervals into candidate. The parsed needle
+	// keeps slices of candidate, so it is reset only on failure.
+	decode := func() bool {
+		pos := 0
+		for i, interval := range intervals {
+			end := pos + int(interval.Size)
+			if inputs[i] != 0 {
+				for shardId := range view {
+					view[shardId] = nil
+					if inputs[i]&(1<<shardId) != 0 {
+						view[shardId] = gathers[i][shardId]
+					}
+				}
+				view[shardIds[i]] = candidate[pos:pos:end]
+				required[shardIds[i]] = true
+				err := enc.ReconstructSome(view, required)
+				required[shardIds[i]] = false
+				if err != nil {
+					copy(candidate, corrupted)
+					return false
+				}
+			}
+			pos = end
+		}
+		check := &needle.Needle{Id: needleId}
+		if check.ReadBytes(candidate, offset, size, ecVolume.Version) != nil || check.Id != needleId {
+			copy(candidate, corrupted)
+			return false
+		}
+		*n = *check
+		return true
+	}
+
+	sets, spent := 0, 0
+	members := make([]int, 0, ecCtx.ParityShards)
+	for k := 1; k <= ecCtx.ParityShards && k <= total; k++ {
+		members = members[:k]
+		for j := range members {
+			members[j] = j
+		}
+		for {
+			var set uint64
+			holdsSuspect := false
+			for _, shardId := range members {
+				set |= 1 << shardId
+				holdsSuspect = holdsSuspect || suspects[erasure_coding.ShardId(shardId)]
+			}
+			if holdsSuspect {
+				if sets++; sets > ecRebuildMaxSets {
+					return nil, false
+				}
+				if plan(set) {
+					if k > 1 {
+						if spent >= ecRebuildMaxBytes {
+							return nil, false
+						}
+						spent += len(corrupted)
+					}
+					if decode() {
+						// The verdict convicts every differing range, and every
+						// other shard the set kept out of the decodes.
+						pos := 0
+						for i, interval := range intervals {
+							end := pos + int(interval.Size)
+							if !bytes.Equal(candidate[pos:end], corrupted[pos:end]) {
+								forgetShardId(ecVolume, shardIds[i])
+							}
+							pos = end
+						}
+						for _, shardId := range members {
+							if !suspects[erasure_coding.ShardId(shardId)] {
+								forgetShardId(ecVolume, erasure_coding.ShardId(shardId))
+							}
+						}
+						return candidate, false
+					}
+				}
+			}
+			j := k - 1
+			for j >= 0 && members[j] == total-k+j {
+				j--
+			}
+			if j < 0 {
+				break
+			}
+			members[j]++
+			for m := j + 1; m < k; m++ {
+				members[m] = members[m-1] + 1
+			}
+		}
+	}
+	return nil, false
+}
+
+func forgetShardId(ecVolume *erasure_coding.EcVolume, shardId erasure_coding.ShardId) {
+	// failed to access the source data nodes, clear it up
+	ecVolume.ShardLocationsLock.Lock()
+	delete(ecVolume.ShardLocations, shardId)
+	ecVolume.ShardLocationsStale = true
+	ecVolume.ShardLocationsLock.Unlock()
+}
+
+// markShardLocationsStale flags the cached map for a prompt re-check after a
+// read failed against one of its locations. Unlike forgetShardId it keeps the
+// entry: a direct read is worth retrying, since a dead peer fails fast.
+func markShardLocationsStale(ecVolume *erasure_coding.EcVolume) {
+	ecVolume.ShardLocationsLock.Lock()
+	ecVolume.ShardLocationsStale = true
+	ecVolume.ShardLocationsLock.Unlock()
+}
+
+// ecShardLocationsTTL is how long a cached shard map is trusted. A complete map
+// is trusted longest. One short of DataShards, or one a failed read has just
+// invalidated, is re-checked promptly: until it is, every read of the dropped
+// shard skips the direct fetch and pays for a Reed-Solomon recovery instead.
+func ecShardLocationsTTL(shardCount int, stale bool, ecCtx *erasure_coding.ECContext) time.Duration {
+	switch {
+	case stale || shardCount < ecCtx.DataShards:
+		return 11 * time.Second
+	case shardCount == ecCtx.Total():
+		return 37 * time.Minute
+	default:
+		return 7 * time.Minute
+	}
+}
+
+func (s *Store) cachedLookupEcShardLocations(ecVolume *erasure_coding.EcVolume) (err error) {
+
+	// Use the volume's own EC ratio so a custom-ratio volume (e.g. 9+3) is judged
+	// complete/recoverable against its real data-shard count, not the build default.
+	// In OSS the ratio is always 10+4, so this is a no-op.
+	ecCtx := ecVolume.ECContext
+	if ecCtx == nil {
+		ecCtx = erasure_coding.NewDefaultECContext(ecVolume.Collection, ecVolume.VolumeId)
+	}
+
+	// Judge the map and consume its mark in one critical section, so a mark raised
+	// from here on belongs to the next refresh rather than being cleared by this
+	// one -- the read that raised it has disproved the map this lookup is about to
+	// install. Recover goroutines mutate all three fields via forgetShardId, so an
+	// unguarded read would race a concurrent map write besides.
+	ecVolume.ShardLocationsLock.Lock()
+	stale := ecVolume.ShardLocationsStale
+	ttl := ecShardLocationsTTL(len(ecVolume.ShardLocations), stale, ecCtx)
+	fresh := ecVolume.ShardLocationsRefreshTime.Add(ttl).After(time.Now())
+	if !fresh {
+		ecVolume.ShardLocationsStale = false
+	}
+	ecVolume.ShardLocationsLock.Unlock()
+	if fresh {
+		return nil
+	}
+
+	glog.V(3).Infof("lookup and cache ec volume %d locations", ecVolume.VolumeId)
+
+	err = operation.WithMasterServerClient(context.Background(), false, s.masterAddress(), s.grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+		req := &master_pb.LookupEcVolumeRequest{
+			VolumeId: uint32(ecVolume.VolumeId),
+		}
+		resp, err := masterClient.LookupEcVolume(context.Background(), req)
+		if err != nil {
+			return fmt.Errorf("lookup ec volume %d: %v", ecVolume.VolumeId, err)
+		}
+		if len(resp.ShardIdLocations) < ecCtx.DataShards {
+			return fmt.Errorf("only %d shards found but %d required", len(resp.ShardIdLocations), ecCtx.DataShards)
+		}
+
+		ecVolume.ShardLocationsLock.Lock()
+		for _, shardIdLocations := range resp.ShardIdLocations {
+			shardId := erasure_coding.ShardId(shardIdLocations.ShardId)
+			delete(ecVolume.ShardLocations, shardId)
+			for _, loc := range shardIdLocations.Locations {
+				ecVolume.ShardLocations[shardId] = append(ecVolume.ShardLocations[shardId], pb.NewServerAddressFromLocation(loc))
+			}
+		}
+		ecVolume.ShardLocationsRefreshTime = time.Now()
+		ecVolume.ShardLocationsLock.Unlock()
+
+		return nil
+	})
+	if err != nil {
+		// The lookup this mark was consumed for did not answer, and the refresh time
+		// is only advanced on success -- so without putting the mark back, a map a
+		// read had already disproved would be trusted for its full window again.
+		// Marking unconditionally is safe: where no mark was consumed the refresh
+		// time is stale anyway, and the next call looks up whatever the mark says.
+		markShardLocationsStale(ecVolume)
+	}
+	return
+}
+
+// errShardQuarantined marks a local shard skipped because its disk is
+// quarantined after repeated IO errors. It reads as not local, so callers go
+// to peers or reconstruction first.
+var errShardQuarantined = fmt.Errorf("ec shard on a quarantined disk: %w", errShardNotLocal)
+
+// readLocalEcShardInterval refuses a shard whose disk is quarantined unless
+// allowQuarantined is set.
+func (s *Store) readLocalEcShardInterval(ecVolume *erasure_coding.EcVolume, shardId erasure_coding.ShardId, buf []byte, offset int64, allowQuarantined bool) error {
+	// Resolve the shard together with the EcVolume on the disk that owns it; the
+	// shard may live on a sibling disk of this server.
+	ownerVolume, shard, found := s.FindEcVolumeWithShard(ecVolume.VolumeId, shardId)
+	if !found {
+		return fmt.Errorf("shard %d for volume %d: %w", shardId, ecVolume.VolumeId, errShardNotLocal)
+	}
+	// Skip a local shard whose identity doesn't match the caller's index, so the
+	// read recovers from the correct generation. Lenient only when the caller has
+	// no identity (pre-upgrade): a known caller must not accept an unstamped local
+	// shard, which would serve a stale pre-upgrade generation.
+	if ecVolume.EncodeTsNs != 0 && ecVolume.EncodeTsNs != ownerVolume.EncodeTsNs {
+		glog.V(1).Infof("skip local ec shard %d.%d from a different encode run: caller EncodeTsNs %d, local %d", ecVolume.VolumeId, shardId, ecVolume.EncodeTsNs, ownerVolume.EncodeTsNs)
+		return fmt.Errorf("shard %d for volume %d: %w", shardId, ecVolume.VolumeId, errShardNotLocal)
+	}
+	if _, _, quarantined := ownerVolume.GetIoErrorState(); quarantined && !allowQuarantined {
+		return fmt.Errorf("shard %d for volume %d: %w", shardId, ecVolume.VolumeId, errShardQuarantined)
+	}
+
+	readBytes, err := shard.ReadAt(buf, offset)
+	if err != nil {
+		ownerVolume.CheckReadWriteError(err)
+		return fmt.Errorf("failed to read local EC shard %d for volume %d: %w", shardId, ecVolume.VolumeId, err)
+	}
+	ownerVolume.CheckReadWriteError(nil)
+	if got, want := readBytes, len(buf); got != want {
+		return fmt.Errorf("expected %d bytes for local EC shard %d on volume %d, got %d", want, shardId, ecVolume.VolumeId, got)
+	}
+
+	return nil
+}
+
+func (s *Store) readRemoteEcShardInterval(sourceDataNodes []pb.ServerAddress, needleId types.NeedleId, vid needle.VolumeId, shardId erasure_coding.ShardId, buf []byte, offset int64, expectedEncodeTsNs int64) (n int, is_deleted bool, err error) {
+
+	if len(sourceDataNodes) == 0 {
+		return 0, false, fmt.Errorf("failed to find ec shard %d.%d", vid, shardId)
+	}
+
+	for _, sourceDataNode := range sourceDataNodes {
+		glog.V(3).Infof("read remote ec shard %d.%d from %s", vid, shardId, sourceDataNode)
+		n, is_deleted, err = s.doReadRemoteEcShardInterval(sourceDataNode, needleId, vid, shardId, buf, offset, expectedEncodeTsNs)
+		if err == nil {
+			return
+		}
+		glog.V(1).Infof("read remote ec shard %d.%d from %s: %v", vid, shardId, sourceDataNode, err)
+	}
+
+	return
+}
+
+func (s *Store) doReadRemoteEcShardInterval(sourceDataNode pb.ServerAddress, needleId types.NeedleId, vid needle.VolumeId, shardId erasure_coding.ShardId, buf []byte, offset int64, expectedEncodeTsNs int64) (n int, is_deleted bool, err error) {
+
+	err = operation.WithVolumeServerClient(false, sourceDataNode, s.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
+
+		// copy data slice
+		shardReadClient, err := client.VolumeEcShardRead(context.Background(), &volume_server_pb.VolumeEcShardReadRequest{
+			VolumeId:   uint32(vid),
+			ShardId:    uint32(shardId),
+			Offset:     offset,
+			Size:       int64(len(buf)),
+			FileKey:    uint64(needleId),
+			EncodeTsNs: expectedEncodeTsNs,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to start reading ec shard %d.%d from %s: %v", vid, shardId, sourceDataNode, err)
+		}
+
+		for {
+			resp, receiveErr := shardReadClient.Recv()
+			if receiveErr == io.EOF {
+				break
+			}
+			if receiveErr != nil {
+				// A deleted answer stands even if the stream fails after it.
+				if is_deleted {
+					break
+				}
+				return fmt.Errorf("receiving ec shard %d.%d from %s: %v", vid, shardId, sourceDataNode, receiveErr)
+			}
+			// Validate the served shard's identity client-side, so the guard holds
+			// even against a pre-upgrade server that ignored the request field (it
+			// returns 0). A mismatch fails the read; the caller recovers from parity.
+			if expectedEncodeTsNs != 0 && resp.EncodeTsNs != expectedEncodeTsNs {
+				return fmt.Errorf("ec shard %d.%d from %s belongs to a different encode run (want %d, got %d)", vid, shardId, sourceDataNode, expectedEncodeTsNs, resp.EncodeTsNs)
+			}
+			if resp.IsDeleted {
+				is_deleted = true
+			}
+			copy(buf[n:n+len(resp.Data)], resp.Data)
+			n += len(resp.Data)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, is_deleted, fmt.Errorf("read ec shard %d.%d from %s: %v", vid, shardId, sourceDataNode, err)
+	}
+
+	// A non-deleted interval must arrive whole: the server stamps EncodeTsNs only
+	// on chunks that carry bytes, so a short or empty stream (e.g. immediate EOF
+	// from a pre-upgrade or stale server) leaves the buffer partly zero-filled and
+	// unvalidated. Reject it so the caller recovers from parity. The is_deleted
+	// short-circuit legitimately returns n=0 with no data and is exempt, matching
+	// readLocalEcShardInterval's got==len(buf) rule for the local path.
+	if !is_deleted && n != len(buf) {
+		return n, is_deleted, fmt.Errorf("short read ec shard %d.%d from %s: got %d want %d", vid, shardId, sourceDataNode, n, len(buf))
+	}
+
+	return
+}
+
+// gatherEcShardIntervals collects the same interval from every shard outside skip,
+// returning one buffer per shard and nil where the shard could not be gathered. It stops
+// once want of them are in hand: reconstruction consumes no more than DataShards, so
+// callers pass that unless a retry needs the wider set.
+func (s *Store) gatherEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, skip map[erasure_coding.ShardId]bool, size int, offset int64, want int) (shardIntervals [][]byte, isDeleted bool) {
+	shardIntervals = make([][]byte, ecCtx.Total())
+
+	// A shard this server already holds costs no round trip and no peer buffer,
+	// so seed those before asking peers for the rest.
+	available := 0
+	var quarantined []erasure_coding.ShardId
+	for shardId := erasure_coding.ShardId(0); int(shardId) < ecCtx.Total() && available < want; shardId++ {
+		if skip[shardId] {
+			continue
+		}
+		if _, _, found := s.FindEcVolumeWithShard(ecVolume.VolumeId, shardId); !found {
+			continue
+		}
+		data := make([]byte, size)
+		if localErr := s.readLocalEcShardInterval(ecVolume, shardId, data, offset, false); localErr != nil {
+			if errors.Is(localErr, errShardQuarantined) {
+				quarantined = append(quarantined, shardId)
+			}
+			glog.V(3).Infof("recover: read local ec shard %d.%d: %v", ecVolume.VolumeId, shardId, localErr)
+			continue
+		}
+		shardIntervals[shardId] = data
+		available++
+	}
+
+	var candidates []erasure_coding.ShardId
+	candidateLocations := make(map[erasure_coding.ShardId][]pb.ServerAddress)
+	ecVolume.ShardLocationsLock.RLock()
+	for shardId, locations := range ecVolume.ShardLocations {
+
+		// skip a shard being rebuilt, one already seeded locally, or an empty shard
+		if skip[shardId] || int(shardId) >= ecCtx.Total() || shardIntervals[shardId] != nil {
+			continue
+		}
+		if len(locations) == 0 {
+			glog.V(3).Infof("readRemoteEcShardInterval missing %d.%d from %+v", ecVolume.VolumeId, shardId, locations)
+			continue
+		}
+		candidates = append(candidates, shardId)
+		candidateLocations[shardId] = locations
+	}
+	ecVolume.ShardLocationsLock.RUnlock()
+
+	// The recover goroutines run concurrently, so the deleted flag is collected
+	// atomically and folded into the named return after they join, rather than each
+	// goroutine writing the shared bool directly.
+	var isDeletedFlag atomic.Bool
+
+	// Reconstruction consumes DataShards buffers, so reading every remaining shard
+	// holds a third more than that and asks a third more of peers that are, by
+	// then, already struggling. Widen only when a wave falls short.
+	for len(candidates) > 0 && available < want {
+		wave := min(want-available, len(candidates))
+		var wg sync.WaitGroup
+		var fetched atomic.Int64
+		for _, shardId := range candidates[:wave] {
+			locations := candidateLocations[shardId]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				data := make([]byte, size)
+				nRead, isDeleted, readErr := s.readRemoteEcShardInterval(locations, needleId, ecVolume.VolumeId, shardId, data, offset, ecVolume.EncodeTsNs)
+				if readErr != nil {
+					glog.V(3).Infof("recover: readRemoteEcShardInterval %d.%d %d bytes from %+v: %v", ecVolume.VolumeId, shardId, nRead, locations, readErr)
+					forgetShardId(ecVolume, shardId)
+				}
+				if isDeleted {
+					isDeletedFlag.Store(true)
+				}
+				if nRead == size {
+					shardIntervals[shardId] = data
+					fetched.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		candidates = candidates[wave:]
+		available += int(fetched.Load())
+		if isDeletedFlag.Load() {
+			// every shard of a deleted needle answers deleted, so another wave cannot help
+			break
+		}
+	}
+
+	isDeleted = isDeletedFlag.Load()
+	// Healthy sources fell short: fill in from the quarantined local disk.
+	for _, shardId := range quarantined {
+		if isDeleted || available >= want {
+			break
+		}
+		if shardIntervals[shardId] != nil {
+			continue
+		}
+		data := make([]byte, size)
+		if readErr := s.readLocalEcShardInterval(ecVolume, shardId, data, offset, true); readErr != nil {
+			glog.V(0).Infof("recover: read quarantined ec shard %d.%d offset %d: %v", ecVolume.VolumeId, shardId, offset, readErr)
+			continue
+		}
+		glog.V(1).Infof("recover: read ec shard %d.%d from its quarantined disk", ecVolume.VolumeId, shardId)
+		shardIntervals[shardId] = data
+		available++
+	}
+
+	return shardIntervals, isDeleted
+}
+
+// checkEcShardRebuildable rejects a parity target. ReconstructData rebuilds data shards
+// only, so it leaves a parity slot nil and reports no error, and the caller would copy
+// that out as a zero-filled buffer and report a successful read.
+func checkEcShardRebuildable(ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, shardIdToRecover erasure_coding.ShardId) error {
+	if int(shardIdToRecover) >= ecCtx.DataShards {
+		return fmt.Errorf("cannot reconstruct shard %d.%d: only data shards can be rebuilt, %d of %d are parity",
+			ecVolume.VolumeId, shardIdToRecover, ecCtx.ParityShards, ecCtx.Total())
+	}
+	return nil
+}
+
+// reconstructEcShardInterval rebuilds one shard's interval in place from the others.
+func reconstructEcShardInterval(ecVolume *erasure_coding.EcVolume, ecCtx *erasure_coding.ECContext, shardIntervals [][]byte, shardIdToRecover erasure_coding.ShardId) error {
+	if err := checkEcShardRebuildable(ecVolume, ecCtx, shardIdToRecover); err != nil {
+		return err
+	}
+
+	enc, err := reedsolomon.New(ecCtx.DataShards, ecCtx.ParityShards)
+	if err != nil {
+		return fmt.Errorf("failed to create encoder: %w", err)
+	}
+
+	// Count and log available shards for diagnostics
+	availableShards := make([]erasure_coding.ShardId, 0, ecCtx.Total())
+	missingShards := make([]erasure_coding.ShardId, 0, ecCtx.ParityShards+1)
+	for shardId := 0; shardId < ecCtx.Total(); shardId++ {
+		if shardIntervals[shardId] != nil {
+			availableShards = append(availableShards, erasure_coding.ShardId(shardId))
+		} else {
+			missingShards = append(missingShards, erasure_coding.ShardId(shardId))
+		}
+	}
+
+	glog.V(3).Infof("recover ec shard %d.%d: %d shards available %v, %d missing %v",
+		ecVolume.VolumeId, shardIdToRecover,
+		len(availableShards), availableShards,
+		len(missingShards), missingShards)
+
+	if len(availableShards) < ecCtx.DataShards {
+		return fmt.Errorf("cannot recover shard %d.%d: only %d shards available %v, need at least %d (missing: %v)",
+			ecVolume.VolumeId, shardIdToRecover,
+			len(availableShards), availableShards,
+			ecCtx.DataShards, missingShards)
+	}
+
+	// Rebuild only what was asked for. ReconstructData rebuilds every missing data
+	// shard, and a gather that stopped at DataShards can leave up to ParityShards of
+	// them missing -- an interval-sized buffer and a decode each, discarded unread.
+	// The mask is Total() long, not DataShards: reedsolomon documents both lengths
+	// but indexes the short one past its end when a parity shard is absent, which
+	// here it usually is.
+	required := make([]bool, ecCtx.Total())
+	required[shardIdToRecover] = true
+	if err := enc.ReconstructSome(shardIntervals, required); err != nil {
+		return fmt.Errorf("failed to reconstruct data for shard %d.%d with %d available shards %v: %w",
+			ecVolume.VolumeId, shardIdToRecover, len(availableShards), availableShards, err)
+	}
+
+	return nil
+}
+
+func (s *Store) recoverOneRemoteEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64) (n int, is_deleted bool, err error) {
+	return s.recoverEcShardInterval(needleId, ecVolume, shardIdToRecover, buf, offset, map[erasure_coding.ShardId]bool{shardIdToRecover: true})
+}
+
+// recoverEcShardInterval rebuilds shardIdToRecover's interval from the shards
+// outside exclude, which always contains shardIdToRecover itself.
+func (s *Store) recoverEcShardInterval(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, shardIdToRecover erasure_coding.ShardId, buf []byte, offset int64, exclude map[erasure_coding.ShardId]bool) (n int, is_deleted bool, err error) {
+	glog.V(3).Infof("recover ec shard %d.%d from other locations", ecVolume.VolumeId, shardIdToRecover)
+
+	// Reconstruct with the volume's OWN EC ratio (loaded from its .vif), not the
+	// build default, so a custom-ratio volume (e.g. 9+3) is decoded with the matrix
+	// that actually produced its shards -- decoding it as 10+4 would corrupt the
+	// recovered bytes. In OSS the ratio is always 10+4, so this is a no-op.
+	ecCtx := ecVolume.ECContext
+	if ecCtx == nil {
+		ecCtx = erasure_coding.NewDefaultECContext(ecVolume.Collection, ecVolume.VolumeId)
+	}
+	// checked before the gather: a doomed target should not cost a fan-out, nor drop a
+	// sibling's location through forgetShardId on the way to failing
+	if err := checkEcShardRebuildable(ecVolume, ecCtx, shardIdToRecover); err != nil {
+		return 0, false, err
+	}
+
+	// Charge the buffers this recovery is about to hold against the budget, so a
+	// burst of them queues here rather than on the heap: DataShards gathered, plus
+	// the one the rebuild allocates for the shard it recreates.
+	weight := int64(len(buf)) * int64(ecCtx.DataShards+1)
+	if weight > ecRecoverBudget {
+		// An interval whose fan-out outgrows the whole budget takes all of it and
+		// so runs alone, rather than blocking forever on an acquire that can never
+		// succeed. The cap is then one such recovery, not a burst of them.
+		weight = ecRecoverBudget
+	}
+	if err = ecRecoverSem.Acquire(context.Background(), weight); err != nil {
+		return 0, false, err
+	}
+	defer ecRecoverSem.Release(weight)
+
+	shardIntervals, is_deleted := s.gatherEcShardIntervals(needleId, ecVolume, ecCtx, exclude, len(buf), offset, ecCtx.DataShards)
+	if err := reconstructEcShardInterval(ecVolume, ecCtx, shardIntervals, shardIdToRecover); err != nil {
+		return 0, is_deleted, err
+	}
+	glog.V(4).Infof("recovered ec shard %d.%d from other locations", ecVolume.VolumeId, shardIdToRecover)
+
+	copy(buf, shardIntervals[shardIdToRecover])
+
+	return len(buf), is_deleted, nil
+}
+
+// noteEcReconstructedInterval counts one shard interval that could not be read
+// directly and was reconstructed from the other shards, and at V(3) logs it with
+// the needle and the volume's encode generation, which the counter can't carry.
+// success means the reconstruction produced data; the needle is validated later.
+func noteEcReconstructedInterval(ecVolume *erasure_coding.EcVolume, needleId types.NeedleId, shardId erasure_coding.ShardId, err error) {
+	result := "success"
+	if err != nil {
+		result = "failure"
+	}
+	stats.VolumeServerECReconstructedIntervalCounter.WithLabelValues(result).Inc()
+	glog.V(3).Infof("ec reconstructed interval: volume=%d generation=%d needle=%s shard=%d result=%s error=%v",
+		ecVolume.VolumeId, ecVolume.EncodeTsNs, needleId, shardId, result, err)
+}
+
+func (s *Store) EcVolumes() (ecVolumes []*erasure_coding.EcVolume) {
+	for _, location := range s.Locations {
+		location.ecVolumesLock.RLock()
+		for _, v := range location.ecVolumes {
+			ecVolumes = append(ecVolumes, v)
+		}
+		location.ecVolumesLock.RUnlock()
+	}
+	slices.SortFunc(ecVolumes, func(a, b *erasure_coding.EcVolume) int {
+		return int(a.VolumeId) - int(b.VolumeId)
+	})
+	return ecVolumes
 }

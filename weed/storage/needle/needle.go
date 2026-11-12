@@ -1,17 +1,17 @@
 package needle
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"io/ioutil"
-
-	"github.com/chrislusf/seaweedfs/weed/images"
-	. "github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/images"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 const (
@@ -26,15 +26,15 @@ const (
 type Needle struct {
 	Cookie Cookie   `comment:"random number to mitigate brute force lookups"`
 	Id     NeedleId `comment:"needle id"`
-	Size   uint32   `comment:"sum of DataSize,Data,NameSize,Name,MimeSize,Mime"`
+	Size   Size     `comment:"sum of DataSize,Data,NameSize,Name,MimeSize,Mime"`
 
 	DataSize     uint32 `comment:"Data size"` //version2
 	Data         []byte `comment:"The actual file data"`
 	Flags        byte   `comment:"boolean flags"` //version2
 	NameSize     uint8  //version2
-	Name         []byte `comment:"maximum 256 characters"` //version2
+	Name         []byte `comment:"maximum 255 characters"` //version2
 	MimeSize     uint8  //version2
-	Mime         []byte `comment:"maximum 256 characters"` //version2
+	Mime         []byte `comment:"maximum 255 characters"` //version2
 	PairsSize    uint16 //version2
 	Pairs        []byte `comment:"additional name value pairs, json format, maximum 64kB"`
 	LastModified uint64 //only store LastModifiedBytesLength bytes, which is 5 bytes to disk
@@ -46,57 +46,33 @@ type Needle struct {
 }
 
 func (n *Needle) String() (str string) {
-	str = fmt.Sprintf("%s Size:%d, DataSize:%d, Name:%s, Mime:%s", formatNeedleIdCookie(n.Id, n.Cookie), n.Size, n.DataSize, n.Name, n.Mime)
+	str = fmt.Sprintf("%s Size:%d, DataSize:%d, Name:%s, Mime:%s Compressed:%v", formatNeedleIdCookie(n.Id, n.Cookie), n.Size, n.DataSize, n.Name, n.Mime, n.IsCompressed())
 	return
 }
 
-func ParseUpload(r *http.Request) (
-	fileName string, data []byte, mimeType string, pairMap map[string]string, isGzipped bool, originalDataSize int,
-	modifiedTime uint64, ttl *TTL, isChunkedFile bool, e error) {
-	pairMap = make(map[string]string)
-	for k, v := range r.Header {
-		if len(v) > 0 && strings.HasPrefix(k, PairNamePrefix) {
-			pairMap[k] = v[0]
-		}
-	}
-
-	if r.Method == "POST" {
-		fileName, data, mimeType, isGzipped, originalDataSize, isChunkedFile, e = parseMultipart(r)
-	} else {
-		isGzipped = false
-		mimeType = r.Header.Get("Content-Type")
-		fileName = ""
-		data, e = ioutil.ReadAll(r.Body)
-		originalDataSize = len(data)
-	}
-	if e != nil {
-		return
-	}
-
-	modifiedTime, _ = strconv.ParseUint(r.FormValue("ts"), 10, 64)
-	ttl, _ = ReadTTL(r.FormValue("ttl"))
-
-	return
-}
-func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool) (n *Needle, originalSize int, e error) {
-	var pairMap map[string]string
-	fname, mimeType, isGzipped, isChunkedFile := "", "", false, false
+func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit int64, bytesBuffer *bytes.Buffer) (n *Needle, originalSize int, contentMd5 string, e error) {
 	n = new(Needle)
-	fname, n.Data, mimeType, pairMap, isGzipped, originalSize, n.LastModified, n.Ttl, isChunkedFile, e = ParseUpload(r)
+	pu, e := ParseUpload(r, sizeLimit, bytesBuffer)
 	if e != nil {
 		return
 	}
-	if len(fname) < 256 {
-		n.Name = []byte(fname)
+	n.Data = pu.Data
+	originalSize = pu.OriginalDataSize
+	n.LastModified = pu.ModifiedTime
+	n.Ttl = pu.Ttl
+	contentMd5 = pu.ContentMd5
+
+	if len(pu.FileName) < 256 {
+		n.Name = []byte(pu.FileName)
 		n.SetHasName()
 	}
-	if len(mimeType) < 256 {
-		n.Mime = []byte(mimeType)
+	if len(pu.MimeType) < 256 {
+		n.Mime = []byte(pu.MimeType)
 		n.SetHasMime()
 	}
-	if len(pairMap) != 0 {
+	if len(pu.PairMap) != 0 {
 		trimmedPairMap := make(map[string]string)
-		for k, v := range pairMap {
+		for k, v := range pu.PairMap {
 			trimmedPairMap[k[len(PairNamePrefix):]] = v
 		}
 
@@ -107,8 +83,9 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool) (n *Needle
 			n.SetHasPairs()
 		}
 	}
-	if isGzipped {
-		n.SetGzipped()
+	if pu.IsGzipped {
+		// println(r.URL.Path, "is set to compressed", pu.FileName, pu.IsGzipped, "dataSize", pu.OriginalDataSize)
+		n.SetIsCompressed()
 	}
 	if n.LastModified == 0 {
 		n.LastModified = uint64(time.Now().Unix())
@@ -118,13 +95,13 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool) (n *Needle
 		n.SetHasTtl()
 	}
 
-	if isChunkedFile {
+	if pu.IsChunkedFile {
 		n.SetIsChunkManifest()
 	}
 
 	if fixJpgOrientation {
-		loweredName := strings.ToLower(fname)
-		if mimeType == "image/jpeg" || strings.HasSuffix(loweredName, ".jpg") || strings.HasSuffix(loweredName, ".jpeg") {
+		loweredName := strings.ToLower(pu.FileName)
+		if pu.MimeType == "image/jpeg" || strings.HasSuffix(loweredName, ".jpg") || strings.HasSuffix(loweredName, ".jpeg") {
 			n.Data = images.FixJpgOrientation(n.Data)
 		}
 	}
@@ -134,7 +111,8 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool) (n *Needle
 	commaSep := strings.LastIndex(r.URL.Path, ",")
 	dotSep := strings.LastIndex(r.URL.Path, ".")
 	fid := r.URL.Path[commaSep+1:]
-	if dotSep > 0 {
+	// dot must be after comma; otherwise path[commaSep+1:dotSep] panics
+	if dotSep > commaSep {
 		fid = r.URL.Path[commaSep+1 : dotSep]
 	}
 
@@ -158,12 +136,23 @@ func (n *Needle) ParsePath(fid string) (err error) {
 	}
 	if delta != "" {
 		if d, e := strconv.ParseUint(delta, 10, 64); e == nil {
-			n.Id += NeedleId(d)
+			if d > math.MaxUint64-uint64(n.Id) {
+				return fmt.Errorf("delta %d overflows needle id %x", d, n.Id)
+			}
+			n.Id += Uint64ToNeedleId(d)
 		} else {
 			return e
 		}
 	}
 	return err
+}
+
+func GetAppendAtNs(volumeLastAppendAtNs uint64) uint64 {
+	return max(uint64(time.Now().UnixNano()), volumeLastAppendAtNs+1)
+}
+
+func (n *Needle) UpdateAppendAtNs(volumeLastAppendAtNs uint64) {
+	n.AppendAtNs = max(uint64(time.Now().UnixNano()), volumeLastAppendAtNs+1)
 }
 
 func ParseNeedleIdCookie(key_hash_string string) (NeedleId, Cookie, error) {
@@ -176,15 +165,22 @@ func ParseNeedleIdCookie(key_hash_string string) (NeedleId, Cookie, error) {
 	split := len(key_hash_string) - CookieSize*2
 	needleId, err := ParseNeedleId(key_hash_string[:split])
 	if err != nil {
-		return NeedleIdEmpty, 0, fmt.Errorf("Parse needleId error: %v", err)
+		return NeedleIdEmpty, 0, fmt.Errorf("Parse needleId error: %w", err)
 	}
 	cookie, err := ParseCookie(key_hash_string[split:])
 	if err != nil {
-		return NeedleIdEmpty, 0, fmt.Errorf("Parse cookie error: %v", err)
+		return NeedleIdEmpty, 0, fmt.Errorf("Parse cookie error: %w", err)
 	}
 	return needleId, cookie, nil
 }
 
 func (n *Needle) LastModifiedString() string {
 	return time.Unix(int64(n.LastModified), 0).Format("2006-01-02T15:04:05")
+}
+
+func max(x, y uint64) uint64 {
+	if x <= y {
+		return y
+	}
+	return x
 }

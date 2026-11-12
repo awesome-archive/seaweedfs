@@ -1,0 +1,349 @@
+//! Self-registration with the weed master, mirroring how filer/s3 keep
+//! connected: hold a KeepConnected stream open to the leader and the node
+//! shows up in ListClusterNodes(client_type="vector").
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use tokio::time::sleep;
+
+use crate::master_pb::{
+    KeepConnectedRequest, ListClusterNodesRequest, seaweed_client::SeaweedClient,
+};
+use crate::security::GrpcTls;
+pub use weed_lance_worker::cluster::{CONNECT_TIMEOUT, connect, grpc_addr};
+
+fn registration(client_addr: &str, filer_group: &str) -> KeepConnectedRequest {
+    KeepConnectedRequest {
+        client_type: "vector".into(),
+        client_address: client_addr.into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        filer_group: filer_group.into(),
+        data_center: String::new(),
+        rack: String::new(),
+        leave_lock_ring: false,
+        ..Default::default()
+    }
+}
+
+// `host:http.grpc` normalizes to `host:http` so a leader hint naming the
+// dialed master does not read as a redirect.
+fn http_addr(master: &str) -> String {
+    let rest = master.rsplit_once("://").map(|(_, r)| r).unwrap_or(master);
+    match rest.rsplit_once(':') {
+        Some((host, port)) => {
+            format!("{host}:{}", port.split('.').next().unwrap_or(port))
+        }
+        None => rest.to_string(),
+    }
+}
+
+/// Retry forever: try each master until a stream opens, hold it until it
+/// errors, then rediscover — same shape as wdclient.KeepConnectedToMaster.
+pub async fn keep_connected(
+    masters: Vec<String>,
+    client_addr: String,
+    filer_group: String,
+    tls: Option<GrpcTls>,
+    metrics: crate::metrics::Metrics,
+) {
+    let client_addr = client_addr.as_str();
+    let filer_group = filer_group.as_str();
+    let tls = tls.as_ref();
+    let metrics = &metrics;
+    loop {
+        try_all_masters(&masters, |master| async move {
+            let result = stream_to(&master, client_addr, filer_group, tls, Some(&metrics)).await;
+            metrics.set_connected(false).await;
+            result
+        })
+        .await;
+        sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// One pass, as wdclient.tryAllMasters: a leader hint is followed at once,
+/// and one that failed this pass is not followed again, so a follower naming
+/// a dead leader cannot hide the other masters.
+async fn try_all_masters<F, Fut>(masters: &[String], mut connect: F)
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Option<String>>>,
+{
+    let mut failed = HashSet::new();
+    for master in masters {
+        if failed.contains(&http_addr(master)) {
+            continue;
+        }
+        let mut target = master.clone();
+        // Bounded, so two masters naming each other cannot spin.
+        for _ in 0..=masters.len() {
+            match connect(target.clone()).await {
+                Ok(Some(hint)) if !failed.contains(&http_addr(&hint)) => target = hint,
+                Ok(_) => break,
+                Err(e) => {
+                    tracing::warn!("master {target}: {e:#}");
+                    failed.insert(http_addr(&target));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn stream_to(
+    master: &str,
+    client_addr: &str,
+    filer_group: &str,
+    tls: Option<&GrpcTls>,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<Option<String>> {
+    let channel = connect(master, tls).await?;
+    // A master answers at once, a follower with its leader hint.
+    let answer_by = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let mut client = SeaweedClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(registration(client_addr, filer_group)).await?;
+    let mut stream = tokio::time::timeout_at(
+        answer_by,
+        client.keep_connected(tokio_stream::wrappers::ReceiverStream::new(rx)),
+    )
+    .await
+    .context("master did not answer keep-connected")??
+    .into_inner();
+    let mut answered = false;
+    let interval = Duration::from_secs(5);
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    // The master keeps the node live while the stream is open; resend the
+    // registration periodically so a reconnect never leaves a stale entry.
+    loop {
+        tokio::select! {
+            msg = stream.message() => match msg? {
+                Some(resp) => {
+                    answered = true;
+                    // A volume_location appears on every response — only
+                    // follow it when the hint points at a different master,
+                    // otherwise the leader keeps identifying itself and we
+                    // would reconnect forever.
+                    if let Some(loc) = resp.volume_location {
+                        if !loc.leader.is_empty()
+                            && http_addr(&loc.leader) != http_addr(master)
+                        {
+                            return Ok(Some(loc.leader));
+                        }
+                    }
+                    if let Some(metrics) = metrics { metrics.set_connected(true).await; }
+                }
+                None => anyhow::bail!("master closed the keep-connected stream"),
+            },
+            _ = tokio::time::sleep_until(answer_by), if !answered => {
+                anyhow::bail!("master did not answer keep-connected");
+            }
+            _ = heartbeat.tick() => {
+                tokio::time::timeout(CONNECT_TIMEOUT, tx.send(registration(client_addr, filer_group))).await
+                    .context("registration send stalled")??;
+                probe_registration(&mut client).await?;
+            }
+        }
+    }
+}
+
+async fn probe_registration(client: &mut SeaweedClient<tonic::transport::Channel>) -> Result<()> {
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.list_cluster_nodes(ListClusterNodesRequest {
+            client_type: "vector".into(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .context("registration heartbeat stalled")??;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_preserves_filer_group() {
+        assert_eq!(
+            registration("vector:8090", "tenant-a").filer_group,
+            "tenant-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_registration_heartbeat_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect_lazy();
+        let mut client = SeaweedClient::new(channel);
+        let result = tokio::time::timeout(CONNECT_TIMEOUT * 3, probe_registration(&mut client))
+            .await
+            .unwrap();
+        assert!(format!("{:#}", result.unwrap_err()).contains("registration heartbeat stalled"));
+        hold.abort();
+    }
+
+    /// Runs one pass against scripted masters and returns the dial order.
+    async fn pass(masters: &[&str], answer: fn(&str) -> Result<Option<String>>) -> Vec<String> {
+        let masters: Vec<String> = masters.iter().map(|m| m.to_string()).collect();
+        let mut tried = Vec::new();
+        try_all_masters(&masters, |master| {
+            tried.push(master.clone());
+            async move { answer(&master) }
+        })
+        .await;
+        tried
+    }
+
+    #[tokio::test]
+    async fn a_dead_leader_hint_does_not_hide_the_other_masters() {
+        let tried = pass(&["m1:9333", "m2:9333", "m3:9333"], |master| match master {
+            "m1:9333" | "m2:9333" => Ok(Some("dead:9333.19333".to_string())),
+            _ => anyhow::bail!("unreachable"),
+        })
+        .await;
+        assert_eq!(tried, ["m1:9333", "dead:9333.19333", "m2:9333", "m3:9333"]);
+    }
+
+    #[tokio::test]
+    async fn a_hint_naming_a_failed_master_in_grpc_form_is_skipped() {
+        let tried = pass(&["m1:9333", "m2:9333"], |master| match master {
+            "m1:9333" => anyhow::bail!("unreachable"),
+            _ => Ok(Some("m1:9333.19333".to_string())),
+        })
+        .await;
+        assert_eq!(tried, ["m1:9333", "m2:9333"]);
+    }
+
+    #[tokio::test]
+    async fn masters_naming_each_other_do_not_spin() {
+        let tried = pass(&["m1:9333", "m2:9333"], |master| {
+            let other = if master == "m1:9333" {
+                "m2:9333"
+            } else {
+                "m1:9333"
+            };
+            Ok(Some(other.to_string()))
+        })
+        .await;
+        assert_eq!(tried.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn dial_to_a_black_holed_master_is_bounded() {
+        // TEST-NET-1 (RFC 5737) is reserved, so nothing answers the SYN.
+        let dial = stream_to("192.0.2.1:9333", "127.0.0.1:8080", "", None, None);
+        let result = tokio::time::timeout(CONNECT_TIMEOUT * 3, dial).await;
+        assert!(matches!(result, Ok(Err(_))), "dial was not bounded");
+    }
+
+    #[tokio::test]
+    async fn a_master_that_never_answers_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let _ = tokio::io::copy(&mut conn, &mut tokio::io::sink()).await;
+        });
+        let master = format!("127.0.0.1:9333.{port}");
+        let open = stream_to(&master, "127.0.0.1:8080", "", None, None);
+        match tokio::time::timeout(CONNECT_TIMEOUT * 3, open).await {
+            Ok(Err(e)) => assert!(format!("{e:#}").contains("did not answer"), "{e:#}"),
+            other => panic!("open was not bounded: {other:?}"),
+        }
+    }
+
+    /// The worker crate's `tests/tls`: a CA and the `engine-a` leaf it signed.
+    fn credentials() -> GrpcTls {
+        let fixture = |name: &str| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../seaweed-worker/crates/lance/tests/tls")
+                .join(name)
+                .display()
+                .to_string()
+        };
+        GrpcTls {
+            ca_path: fixture("ca.pem"),
+            cert_path: fixture("a.pem"),
+            key_path: fixture("a.key"),
+            allowed_server_names: Vec::new(),
+            allowed_server_wildcard_domain: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_master_that_stalls_the_tls_handshake_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let _ = tokio::io::copy(&mut conn, &mut tokio::io::sink()).await;
+        });
+        let master = format!("127.0.0.1:9333.{port}");
+        let tls = credentials();
+        let open = stream_to(&master, "127.0.0.1:8080", "", Some(&tls), None);
+        match tokio::time::timeout(CONNECT_TIMEOUT * 3, open).await {
+            Ok(Err(e)) => assert!(format!("{e:#}").contains("did not complete"), "{e:#}"),
+            other => panic!("handshake was not bounded: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_credential_read_that_stalls_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("ca.pem");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        // Every connection is dropped at once, so a dial that skipped the read
+        // fails its handshake instead of timing out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                drop(conn);
+            }
+        });
+        let mut tls = credentials();
+        tls.ca_path = fifo.display().to_string();
+        let master = format!("127.0.0.1:9333.{port}");
+        let open = stream_to(&master, "127.0.0.1:8080", "", Some(&tls), None);
+        let result = tokio::time::timeout(CONNECT_TIMEOUT * 3, open).await;
+        use std::io::Write;
+        let mut cleanup = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let replacement = dir.path().join("ca.replacement");
+        std::fs::write(&replacement, b"invalid CA").unwrap();
+        std::fs::rename(&replacement, &fifo).unwrap();
+        cleanup.write_all(b"invalid CA").unwrap();
+        drop(cleanup);
+        match result {
+            Ok(Err(e)) => assert!(format!("{e:#}").contains("did not complete"), "{e:#}"),
+            other => panic!("credential read was not bounded: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grpc_addr_refuses_a_port_past_65535() {
+        assert_eq!(grpc_addr("m1:9333").unwrap(), "http://m1:19333");
+        assert_eq!(grpc_addr("m1:55535").unwrap(), "http://m1:65535");
+        assert_eq!(grpc_addr("m1:60000.7000").unwrap(), "http://m1:7000");
+        assert!(grpc_addr("m1:55536").is_err());
+        assert!(grpc_addr("https://m1:60000").is_err());
+        assert!(grpc_addr("m1:65536").is_err());
+        assert!(grpc_addr("m1:9333.65536").is_err());
+    }
+}
